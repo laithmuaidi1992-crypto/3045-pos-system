@@ -3746,7 +3746,7 @@ setNP({bc:"",n:"",a:"",p:"",c:"",cat:"food",u:"pc",e:"📦",exp:"",img:null,supp
 <button onClick={()=>setSetupStep(5)} style={{flex:1,padding:12,background:"#fff",border:"1.5px solid #e5e7eb",borderRadius:10,color:"#6b7280",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"var(--f)"}}>← {rtl?"السابق":"Back"}</button>
 <button disabled={!setupData.adminPwd} onClick={async()=>{
 // Verify password
-if(setupData.adminPwd!==cu.password){sT("✗ "+(rtl?"كلمة المرور خاطئة":"Wrong password"),"err");return}
+if(setupData.adminPwd!==cu.pw){sT("✗ "+(rtl?"كلمة المرور خاطئة":"Wrong password"),"err");return}
 if(!confirm(rtl?"⚠️ هل أنت متأكد من الانطلاق؟ لا يمكن التراجع":"⚠️ Are you sure you want to go live? This cannot be undone"))return;
 
 try{
