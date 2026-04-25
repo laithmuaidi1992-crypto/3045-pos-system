@@ -75,9 +75,9 @@ const DB = {
       const {data:batchItems}=await sb.from("transaction_items").select("*").in("transaction_id",batch).limit(5000);
       if(batchItems)items=items.concat(batchItems);
     }
-    return allTxs.map(tx=>({id:tx.id,rn:tx.receipt_no,seq:tx.seq_number||0,voidStatus:tx.void_status||"active",voidReason:tx.void_reason||null,voidBy:tx.void_by||null,voidAt:tx.void_at||null,sub:+tx.subtotal,disc:+tx.discount,dp:+tx.discount_pct,tax:+tx.tax,tot:+tx.total,method:tx.payment_method,ct:+tx.cash_tendered,ch:+tx.change_amount,ts:tx.created_at,time:(()=>{try{return new Date(tx.created_at).toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",hour12:false})}catch{return"00:00"}})(),date:(()=>{try{return new Date(tx.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}catch{return"—"}})(),custPhone:tx.customer_phone,custName:tx.cashier_name,cashierId:tx.cashier_id,cashierName:tx.cashier_name,ptsEarned:tx.points_earned||0,ptsRedeemed:tx.points_redeemed||0,items:items.filter(i=>i.transaction_id===tx.id).map(i=>({id:i.product_id||"misc_"+i.id,n:i.product_name||"—",a:i.product_name_ar||i.product_name||"—",bc:i.barcode||"MISC",p:+i.unit_price,qty:i.quantity,_isMisc:!i.product_id}))}));
+    return allTxs.map(tx=>({id:tx.id,rn:tx.receipt_no,seq:tx.seq_number||0,voidStatus:tx.void_status||"active",voidReason:tx.void_reason||null,voidBy:tx.void_by||null,voidAt:tx.void_at||null,sub:+tx.subtotal,disc:+tx.discount,dp:+tx.discount_pct,tax:+tx.tax,tot:+tx.total,method:tx.payment_method,ct:+tx.cash_tendered,ch:+tx.change_amount,ts:tx.created_at,time:(()=>{try{return new Date(tx.created_at).toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",hour12:false})}catch{return"00:00"}})(),date:(()=>{try{return new Date(tx.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}catch{return"—"}})(),custPhone:tx.customer_phone,custName:tx.cashier_name,cashierId:tx.cashier_id,cashierName:tx.cashier_name,shiftId:tx.shift_id||null,ptsEarned:tx.points_earned||0,ptsRedeemed:tx.points_redeemed||0,items:items.filter(i=>i.transaction_id===tx.id).map(i=>({id:i.product_id||"misc_"+i.id,n:i.product_name||"—",a:i.product_name_ar||i.product_name||"—",bc:i.barcode||"MISC",p:+i.unit_price,qty:i.quantity,_isMisc:!i.product_id}))}));
   },
-  async addTransaction(tx, cashierId, cashierName, pkgs) {
+  async addTransaction(tx, cashierId, cashierName, pkgs, shiftId) {
     // Generate sequential receipt number: KH-130426-001
     const today=new Date();
     const dateStr=String(today.getDate()).padStart(2,"0")+String(today.getMonth()+1).padStart(2,"0")+String(today.getFullYear()).slice(2);
@@ -92,7 +92,17 @@ const DB = {
     const newRn=cashierPrefix+"-"+dateStr+"-"+seqStr;
     tx.rn=newRn; // override the receipt number
     
-    await sb.from("transactions").insert({id:tx.id,receipt_no:tx.rn,seq_number:nextSeq,subtotal:tx.sub,discount:tx.disc,discount_pct:tx.dp,tax:tx.tax,total:tx.tot,payment_method:tx.method,cash_tendered:tx.ct,change_amount:tx.ch,cashier_id:cashierId,cashier_name:cashierName,void_status:"active"});
+    const{error:txErr}=await sb.from("transactions").insert({id:tx.id,receipt_no:tx.rn,seq_number:nextSeq,subtotal:tx.sub,discount:tx.disc,discount_pct:tx.dp,tax:tx.tax,total:tx.tot,payment_method:tx.method,cash_tendered:tx.ct,change_amount:tx.ch,cashier_id:cashierId,cashier_name:cashierName,void_status:"active",shift_id:shiftId||null});
+    if(txErr){
+      console.error("[DB.addTransaction] ❌",txErr);
+      if(txErr.code === '23505'){
+        throw new Error("⚠️ فاتورة بنفس الرقم محفوظة مسبقاً");
+      }
+      if(txErr.code === '23514'){
+        throw new Error("⚠️ قيمة غير صالحة في الفاتورة");
+      }
+      throw new Error("فشل حفظ الفاتورة: "+txErr.message);
+    }
     // Detect misc/weight items: their id starts with "misc_" or contains "_w" (weight clones)
     const isMisc=(i)=>(i._isMisc||(typeof i.id==="string"&&(i.id.startsWith("misc_"))));
     const rows=tx.items.map(i=>({
@@ -110,37 +120,91 @@ const DB = {
     // Decrease stock — for packages, deduct from PARENT (Model A: shared stock)
     pkgs=pkgs||{};
     if(typeof pkgs==="string"){try{pkgs=JSON.parse(pkgs)}catch{pkgs={}}}
-    console.log("[DB] pkgs keys:", Object.keys(pkgs));
-    for(const i of tx.items){
+    // ⚡ STOCK UPDATES MOVED TO BACKGROUND — see DB.updateStockForTransaction
+    // The transaction record is now saved in just 3 round-trips (seq, insert tx, insert items).
+    // Stock updates run AFTER the receipt is shown to the cashier, in parallel, with retry.
+  },
+
+  // ⚡ Fast parallel stock update — runs AFTER addTransaction in background.
+  // Returns {ok, failed} where failed=[{productId,qty,error}].
+  // All product updates run in parallel via Promise.all → 1 round-trip latency
+  // instead of N sequential round-trips. Caller is expected to retry failed ones.
+  async updateStockForTransaction(items, pkgs){
+    pkgs=pkgs||{};
+    if(typeof pkgs==="string"){try{pkgs=JSON.parse(pkgs)}catch{pkgs={}}}
+    const isMisc=(i)=>(i._isMisc||(typeof i.id==="string"&&i.id.startsWith("misc_")));
+    // Aggregate: same parent product hit multiple times → sum qty in one update
+    const updates={}; // productId → totalQty to deduct
+    const toResolveLinked=[]; // items whose pkg info needs DB lookup
+    for(const i of items){
       if(isMisc(i))continue;
-      // Check packages settings first
       let pkg=pkgs[i.bc];
-      // If not in packages, check product's linked_parent_id
-      if(!pkg || !pkg.parentId){
-        const realId=typeof i.id==="string"&&i.id.includes("_w")?i.id.split("_w")[0]:i.id;
-        const{data:prodCheck}=await sb.from("products").select("linked_parent_id,linked_qty").eq("id",realId).single();
-        if(prodCheck && prodCheck.linked_parent_id){
-          pkg={parentId:prodCheck.linked_parent_id, packSize:prodCheck.linked_qty||1};
-          console.log("[DB] Found linkedTo for",i.bc,"→ parent:",pkg.parentId,"×",pkg.packSize);
-        }
-      }
-      if(pkg&&pkg.parentId&&pkg.packSize){
-        console.log("[STOCK] ✓ Package sale:",i.bc,"→ deduct",i.qty,"×",pkg.packSize,"=",i.qty*pkg.packSize,"from parent",pkg.parentId);
-        try{
-          const{data:p,error:e1}=await sb.from("products").select("stock").eq("id",pkg.parentId).single();
-          if(e1){console.error("[STOCK] ❌ Read failed for",pkg.parentId,e1)}
-          else if(p){const{error:e2}=await sb.from("products").update({stock:p.stock-(i.qty*pkg.packSize)}).eq("id",pkg.parentId);if(e2)console.error("[STOCK] ❌ Update failed for",pkg.parentId,e2);else console.log("[STOCK] ✓ Updated",pkg.parentId,":",p.stock,"→",p.stock-(i.qty*pkg.packSize))}
-        }catch(stockErr){console.error("[STOCK] ❌ Package stock error:",stockErr)}
+      const realId=typeof i.id==="string"&&i.id.includes("_w")?i.id.split("_w")[0]:i.id;
+      if(!pkg||!pkg.parentId){
+        // Defer: needs DB lookup of linked_parent_id
+        toResolveLinked.push({item:i,realId});
       }else{
-        // Strip _w suffix for weight items (use real product id)
-        const realId=typeof i.id==="string"&&i.id.includes("_w")?i.id.split("_w")[0]:i.id;
-        try{
-          const{data:p,error:e1}=await sb.from("products").select("stock").eq("id",realId).single();
-          if(e1){console.error("[STOCK] ❌ Read failed for",realId,e1)}
-          else if(p){const newStock=p.stock-(i._weight||i.qty);const{error:e2}=await sb.from("products").update({stock:newStock}).eq("id",realId);if(e2)console.error("[STOCK] ❌ Update failed for",realId,e2);else console.log("[STOCK] ✓ Updated",realId,":",p.stock,"→",newStock)}
-        }catch(stockErr){console.error("[STOCK] ❌ Stock error:",stockErr)}
+        const totalQty=i.qty*pkg.packSize;
+        updates[pkg.parentId]=(updates[pkg.parentId]||0)+totalQty;
       }
     }
+    // Resolve linked products in ONE batched query
+    if(toResolveLinked.length>0){
+      const ids=[...new Set(toResolveLinked.map(x=>x.realId))];
+      try{
+        const{data:linkRows}=await sb.from("products").select("id,linked_parent_id,linked_qty").in("id",ids);
+        const linkMap={};
+        (linkRows||[]).forEach(r=>{linkMap[r.id]=r});
+        for(const {item,realId} of toResolveLinked){
+          const link=linkMap[realId];
+          if(link&&link.linked_parent_id){
+            const parentId=link.linked_parent_id;
+            const packSize=link.linked_qty||1;
+            updates[parentId]=(updates[parentId]||0)+(item.qty*packSize);
+          }else{
+            // No package link — deduct from product itself
+            updates[realId]=(updates[realId]||0)+(item._weight||item.qty);
+          }
+        }
+      }catch(e){
+        console.error("[STOCK-BG] Link resolution failed:",e);
+        // Fallback: deduct directly from product id
+        for(const {item,realId} of toResolveLinked){
+          updates[realId]=(updates[realId]||0)+(item._weight||item.qty);
+        }
+      }
+    }
+    // Now update all affected products IN PARALLEL
+    const productIds=Object.keys(updates);
+    if(productIds.length===0)return{ok:true,failed:[]};
+    // Step 1: read current stock for all products in ONE query
+    const failed=[];
+    let currentStocks={};
+    try{
+      const{data:rows,error}=await sb.from("products").select("id,stock").in("id",productIds);
+      if(error)throw error;
+      (rows||[]).forEach(r=>{currentStocks[r.id]=r.stock});
+    }catch(e){
+      console.error("[STOCK-BG] Bulk read failed:",e);
+      productIds.forEach(pid=>failed.push({productId:pid,qty:updates[pid],error:String(e)}));
+      return{ok:false,failed};
+    }
+    // Step 2: update in parallel
+    const updatePromises=productIds.map(async pid=>{
+      const curStock=currentStocks[pid];
+      if(curStock===undefined){return{pid,ok:false,error:"product_not_found"}}
+      const newStock=curStock-updates[pid];
+      try{
+        const{error}=await sb.from("products").update({stock:newStock}).eq("id",pid);
+        if(error)return{pid,ok:false,error:error.message};
+        return{pid,ok:true};
+      }catch(e){return{pid,ok:false,error:String(e)}}
+    });
+    const results=await Promise.all(updatePromises);
+    results.forEach(r=>{
+      if(!r.ok)failed.push({productId:r.pid,qty:updates[r.pid],error:r.error});
+    });
+    return{ok:failed.length===0,failed};
   },
 
   // Purchase Invoices
@@ -170,7 +234,20 @@ const DB = {
     if(inv.is_reconciliation) insertData.is_reconciliation = true;
     if(inv.reconciliation_status) insertData.reconciliation_status = inv.reconciliation_status;
     const {data,error:invErr}=await sb.from("purchase_invoices").insert(insertData).select().single();
-    if(invErr){console.error("[DB.addInvoice] ❌ Invoice insert FAILED:",invErr);throw new Error("فشل حفظ الفاتورة: "+invErr.message)}
+    if(invErr){
+      console.error("[DB.addInvoice] ❌ Invoice insert FAILED:",invErr);
+      // Friendly Arabic messages for known DB errors
+      if(invErr.code === '23505'){ // unique_violation
+        throw new Error("⚠️ فاتورة بنفس الرقم محفوظة مسبقاً — لا داعي للضغط على حفظ مرة ثانية");
+      }
+      if(invErr.code === '23514'){ // check_constraint_violation
+        throw new Error("⚠️ قيمة غير صالحة في الفاتورة (كمية سالبة أو رقم غير منطقي)");
+      }
+      if(invErr.code === '23503'){ // foreign_key_violation
+        throw new Error("⚠️ بيانات مرجعية مفقودة — تحقق من المنتج والمورّد");
+      }
+      throw new Error("فشل حفظ الفاتورة: "+invErr.message);
+    }
     if(!data){console.error("[DB.addInvoice] ❌ No data returned");throw new Error("فشل حفظ الفاتورة: لم يتم إرجاع بيانات")}
     console.log("[DB.addInvoice] ✓ Invoice saved:",data.id,inv.invoiceNo);
     // Save items - use only columns that exist in DB
@@ -178,11 +255,23 @@ const DB = {
     const{error:itemsErr}=await sb.from("purchase_invoice_items").insert(rows);
     if(itemsErr){
       console.error("[DB.addInvoice] ❌ Items insert FAILED:",itemsErr);
+      // Friendly error
+      if(itemsErr.code === '23514'){
+        throw new Error("⚠️ بنود الفاتورة فيها قيم غير صالحة (كمية سالبة)");
+      }
       // Try again without optional columns
       console.log("[DB.addInvoice] Retrying items without optional columns...");
       const basicRows=inv.items.map(i=>({invoice_id:data.id,product_id:i.prodId||null,product_name:i.productName,quantity:parseInt(i.qty)||0,cost_price:parseFloat(i.cost)||0,line_total:+((parseFloat(i.cost)||0)*(parseInt(i.qty)||0)).toFixed(3)}));
       const{error:retryErr}=await sb.from("purchase_invoice_items").insert(basicRows);
-      if(retryErr)console.error("[DB.addInvoice] ❌ Items retry also FAILED:",retryErr);
+      if(retryErr){
+        console.error("[DB.addInvoice] ❌ Items retry also FAILED:",retryErr);
+        // CRITICAL: invoice header was saved but items failed — must clean up to prevent ghost invoice
+        try{
+          await sb.from("purchase_invoices").delete().eq("id",data.id);
+          console.log("[DB.addInvoice] ✓ Rolled back invoice header (items failed)");
+        }catch(rollbackErr){console.error("[DB.addInvoice] ❌ Rollback failed too:",rollbackErr)}
+        throw new Error("⚠️ فشل حفظ بنود الفاتورة: "+retryErr.message);
+      }
       else console.log("[DB.addInvoice] ✓ Items saved (basic columns)");
     }else{console.log("[DB.addInvoice] ✓ Items saved:",rows.length)}
     // Stock update is handled by saveNewInvoice (with WAC + batches) — DO NOT update here
@@ -358,7 +447,18 @@ const DB = {
   // ── BATCH TRACKING ──
   async getBatches(productId) { const q=sb.from("product_batches").select("*").order("expiry_date",{ascending:true}); if(productId)q.eq("product_id",productId); const{data}=await q; return data||[]; },
   async getAllBatches() { const{data}=await sb.from("product_batches").select("*").order("expiry_date",{ascending:true}); return data||[]; },
-  async addBatch(b) { const{data}=await sb.from("product_batches").insert(b).select().single(); return data; },
+  async addBatch(b) { 
+    const{data,error}=await sb.from("product_batches").insert(b).select().single(); 
+    if(error){
+      console.error("[DB.addBatch] ❌",error);
+      if(error.code === '23514'){
+        throw new Error("⚠️ كمية الباتش غير صالحة (سالبة أو متجاوزة)");
+      }
+      // Other errors: log but don't throw (batches are tracking only, not critical)
+      return null;
+    }
+    return data; 
+  },
   async updateBatch(id,u) { await sb.from("product_batches").update({...u,updated_at:new Date().toISOString()}).eq("id",id); },
   async deleteBatch(id) { await sb.from("product_batches").delete().eq("id",id); },
   async deductBatchFIFO(productId,qty) { const{data}=await sb.rpc("deduct_batch_fifo",{p_product_id:productId,p_quantity:qty}); return data||[]; },
@@ -399,7 +499,21 @@ const DB = {
   async getExpiringBatches() { const{data}=await sb.from("v_expiring_batches").select("*"); return data||[]; },
   // ── CASH SHIFTS ──
   async getShifts(date) { const q=sb.from("cash_shifts").select("*").order("created_at",{ascending:false}); if(date)q.eq("shift_date",date); const{data}=await q; return data||[]; },
-  async openShift(s) { const{data}=await sb.from("cash_shifts").insert(s).select().single(); return data; },
+  async openShift(s) {
+    // ⚡ Prevent duplicate shifts: if user already has an open shift, return it
+    const {data: existing} = await sb.from("cash_shifts")
+      .select("*")
+      .eq("user_id", s.user_id)
+      .eq("status", "open")
+      .order("shift_start", {ascending: false})
+      .limit(1);
+    if(existing && existing.length > 0){
+      console.log("[SHIFT] User already has open shift:", existing[0].id);
+      return {...existing[0], _wasExisting: true};
+    }
+    const{data}=await sb.from("cash_shifts").insert(s).select().single();
+    return data ? {...data, _wasExisting: false} : null;
+  },
   async closeShift(id,u) { await sb.from("cash_shifts").update(u).eq("id",id); },
   async deleteShift(id) { await sb.from("cash_shifts").delete().eq("id",id); },
   // ── EOD REPORTS ──
@@ -1212,6 +1326,13 @@ useEffect(()=>{
 const sT=(m,ty)=>{setToast({m,ty});setTimeout(()=>setToast(null),2200)};
 const[posPage,setPosPage]=useState(0);const POS_PAGE_SIZE=60;
 const[posDropdownClosed,setPosDropdownClosed]=useState(false);
+const[navOpenMenu,setNavOpenMenu]=useState(null); // which top-nav dropdown is open
+const[mobileMenuOpen,setMobileMenuOpen]=useState(false); // mobile hamburger drawer
+const[cmdkOpen,setCmdkOpen]=useState(false); // Ctrl+K command palette
+const[cmdkQuery,setCmdkQuery]=useState("");
+const[cmdkIdx,setCmdkIdx]=useState(0);
+const navRef=useRef(null);
+const cmdkRef=useRef(null);
 const posSearchRef=useRef(null);
 useEffect(()=>setPosPage(0),[cat,search]);
 const fp=useMemo(()=>prods.filter(p=>(cat==="all"||p.cat===cat)&&(!search||p.n.toLowerCase().includes(search.toLowerCase())||p.a.includes(search)||p.bc.includes(search))),[search,cat,prods]);
@@ -1423,6 +1544,13 @@ const cP=async()=>{
   }
   if(!cart||cart.length===0){processingRef.current=false;alert(rtl?"⚠️ السلة فارغة":"⚠️ Cart is empty");return}
   
+  // ⚡ Defensive: shift must be open to record sale (prevents orphan transactions)
+  if(!activeShift||!activeShift.id){
+    processingRef.current=false;
+    alert(rtl?"⚠️ يجب فتح وردية قبل البيع!\n\nاذهب إلى 'إغلاق الصندوق' وافتح وردية أولاً.":"⚠️ You must open a shift before selling!\n\nGo to 'Register Closures' and open a shift first.");
+    return;
+  }
+  
   // FIX #6: ENGAGE LOCK
   setProcessing(true);
   
@@ -1447,7 +1575,7 @@ const cP=async()=>{
     return item;
   });
   
-  const tx={id:gI(),rn:gR(),items:enrichedCart,sub,disc:dA,dp:aDisc,promoDiscount,tax,tot:finalTot,method:pmMod,ct:pmMod==="cash"?(isNaN(parseFloat(cTend))?finalTot:parseFloat(cTend)):finalTot,ch:pmMod==="cash"?(isNaN(parseFloat(cTend))?0:Math.max(0,parseFloat(cTend)-finalTot)):0,ts:now.toISOString(),time:now.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",hour12:false}),date:now.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}),custPhone:selCust?.phone||null,custName:selCust?.name||null,ptsEarned:earnablePts,ptsRedeemed:redeemPts};
+  const tx={id:gI(),rn:gR(),items:enrichedCart,sub,disc:dA,dp:aDisc,promoDiscount,tax,tot:finalTot,method:pmMod,ct:pmMod==="cash"?(isNaN(parseFloat(cTend))?finalTot:parseFloat(cTend)):finalTot,ch:pmMod==="cash"?(isNaN(parseFloat(cTend))?0:Math.max(0,parseFloat(cTend)-finalTot)):0,ts:now.toISOString(),time:now.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",hour12:false}),date:now.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}),custPhone:selCust?.phone||null,custName:selCust?.name||null,ptsEarned:earnablePts,ptsRedeemed:redeemPts,shiftId:activeShift?.id||null};
   
   console.log("[PAY] Starting payment for",tx.rn,"total:",finalTot);
   
@@ -1462,8 +1590,8 @@ const cP=async()=>{
   
   // Save to DB FIRST — get correct receipt number
   try{
-    await DB.addTransaction(tx,cu?.id,cu?.fn,pkgs);
-    console.log("[PAY] ✓ Saved to DB:",tx.rn);
+    await DB.addTransaction(tx,cu?.id,cu?.fn,pkgs,activeShift?.id);
+    console.log("[PAY] ✓ Saved to DB:",tx.rn,"on shift:",activeShift?.id);
   }catch(e){
     console.error("[PAY] ✗ DB SAVE FAILED:",e);
     processingRef.current = false;
@@ -1508,15 +1636,42 @@ const cP=async()=>{
   
   clr(); // Clear cart immediately
   
-  // Refresh products from DB for accurate stock
-  try{const np=await DB.getProducts();setProds(np)}catch(e){console.error("[PAY] Product refresh:",e)}
-  
-  // Release lock
+  // ⚡ Cashier is now FREE — release UI lock immediately
+  // Stock updates run in background below (with retry).
   processingRef.current = false;
   setProcessing(false);
   
   // 3. Background tasks — fire and forget
   setTimeout(async () => {
+    // ━━━ STOCK UPDATE WITH RETRY (CRITICAL — must succeed) ━━━
+    // Runs in background AFTER cashier is free. Uses parallel batch updates.
+    // Retries up to 3 times before giving up and warning the cashier.
+    let stockUpdateOk=false;
+    let lastFailedItems=[];
+    for(let attempt=1;attempt<=3;attempt++){
+      try{
+        const itemsToUpdate=lastFailedItems.length>0
+          ?cartSnapshot.filter(i=>lastFailedItems.some(f=>f.productId===i.id||(typeof i.id==="string"&&i.id.includes("_w")&&f.productId===i.id.split("_w")[0])))
+          :cartSnapshot;
+        const result=await DB.updateStockForTransaction(itemsToUpdate,pkgs);
+        if(result.ok){
+          stockUpdateOk=true;
+          console.log("[PAY] ✓ Stock updated successfully on attempt",attempt);
+          break;
+        }
+        lastFailedItems=result.failed;
+        console.warn("[PAY] ⚠ Stock update attempt",attempt,"had",result.failed.length,"failures, retrying...");
+        await new Promise(r=>setTimeout(r,500*attempt)); // Exponential backoff
+      }catch(e){
+        console.error("[PAY] Stock update attempt",attempt,"threw:",e);
+        await new Promise(r=>setTimeout(r,500*attempt));
+      }
+    }
+    if(!stockUpdateOk){
+      console.error("[PAY] ❌ Stock update FAILED after 3 retries for tx",tx.rn,"failed items:",lastFailedItems);
+      sT("⚠️ "+(rtl?"تم البيع لكن تحديث المخزون فشل — راجع الإدارة (الفاتورة "+tx.rn+")":"Sale saved but stock update failed — contact admin (Receipt "+tx.rn+")"),"err");
+    }
+    
     // Customer points
     if(selCust){
       try{
@@ -1583,6 +1738,31 @@ useEffect(()=>{
   const timer=setTimeout(()=>document.addEventListener("mousedown",handleClickOutside),100);
   return()=>{clearTimeout(timer);document.removeEventListener("mousedown",handleClickOutside)};
 },[posDropdownClosed,tab,search,cat]);
+
+// ── Nav Dropdowns: close on outside click + Escape ──
+useEffect(()=>{
+  if(!navOpenMenu)return;
+  const handleClick=(e)=>{
+    if(navRef.current&&!navRef.current.contains(e.target))setNavOpenMenu(null);
+  };
+  const handleKey=(e)=>{if(e.key==="Escape")setNavOpenMenu(null)};
+  const t1=setTimeout(()=>document.addEventListener("mousedown",handleClick),50);
+  document.addEventListener("keydown",handleKey);
+  return()=>{clearTimeout(t1);document.removeEventListener("mousedown",handleClick);document.removeEventListener("keydown",handleKey)};
+},[navOpenMenu]);
+
+// ── Ctrl+K / Cmd+K: Global Command Palette (works even inside inputs) ──
+useEffect(()=>{
+  if(!loggedIn)return;
+  const handler=(e)=>{
+    if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="k"){
+      e.preventDefault();
+      setCmdkOpen(true);setCmdkQuery("");setCmdkIdx(0);
+    }
+  };
+  window.addEventListener("keydown",handler);
+  return()=>window.removeEventListener("keydown",handler);
+},[loggedIn]);
 // ── KEYBOARD SHORTCUTS ──
 useEffect(()=>{
 const handleKey=(e)=>{
@@ -1723,9 +1903,48 @@ const loyaltyPct=tC>0?((loyaltySales/tC)*100).toFixed(0):0;
 
 // ── LOGIN → CHECK DATABASE ──────────────────────────────────
 const hL=()=>{const f=users.find(u=>u.un===lu&&u.pw===lp&&u.st==="active");if(f){setCU(f);setLI(true);setLE(false);setTab("home");DB.getTodayAttendance(f.id).then(a=>setMyAtt(a)).catch(()=>{});
+// 💾 Persist session for 12 hours (survives F5/refresh)
+try{
+  const sessionData={
+    user:{id:f.id,un:f.un,fn:f.fn,fa:f.fa,role:f.role,st:f.st,perms:f.perms,avatar:f.avatar},
+    expiry:Date.now()+12*60*60*1000  // 12 hours
+  };
+  localStorage.setItem("3045_session",JSON.stringify(sessionData));
+}catch(e){console.warn("[SESSION] Could not save session:",e)}
 // Fetch weather (Open-Meteo API — free, no key)
 fetch("https://api.open-meteo.com/v1/forecast?latitude=32.55&longitude=35.85&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=Asia/Amman&forecast_days=3").then(r=>r.json()).then(d=>{if(d.current)setWeather(d)}).catch(()=>{})
 }else setLE(true)};
+
+// 💾 Restore saved session on app mount (F5 / page reload protection)
+useEffect(()=>{
+  try{
+    const raw=localStorage.getItem("3045_session");
+    if(!raw)return;
+    const{user,expiry}=JSON.parse(raw);
+    if(!user||!user.un||!expiry||expiry<=Date.now()){
+      localStorage.removeItem("3045_session");
+      return;
+    }
+    // Restore immediately for instant UX
+    setCU(user);setLI(true);setLE(false);
+    console.log("[SESSION] Restored for",user.un,"— expires in",Math.round((expiry-Date.now())/60000),"min");
+    // Background validation: ensure user still active in DB (no flash of invalid session)
+    DB.getUsers().then(allUsers=>{
+      const fresh=allUsers.find(u=>u.id===user.id);
+      if(!fresh||fresh.st!=="active"){
+        console.warn("[SESSION] User no longer active — logging out");
+        localStorage.removeItem("3045_session");
+        setCU(null);setLI(false);
+        sT("⚠️ "+(rtl?"تم إنهاء الجلسة — حسابك غير نشط":"Session ended — account inactive"),"err");
+      }else{
+        // Refresh permissions in case admin changed them
+        setCU(fresh);
+        DB.getTodayAttendance(fresh.id).then(a=>setMyAtt(a)).catch(()=>{});
+      }
+    }).catch(e=>console.warn("[SESSION] Validation failed (offline?):",e));
+  }catch(e){console.warn("[SESSION] Restore failed:",e);try{localStorage.removeItem("3045_session")}catch{}}
+// eslint-disable-next-line react-hooks/exhaustive-deps
+},[]);
 
 // ── SAVE INVOICE → DATABASE ─────────────────────────────────
 // NEW: Compute return status for a transaction
@@ -2119,6 +2338,48 @@ const returnedQtyMap = useMemo(()=>{
   return m;
 },[allReturnItems]);
 
+// ── Map: receipt_no → { itemKey → totalReturnedQty } ──
+// itemKey = product_id (for normal items) OR "misc:"+name (for misc/weight items)
+// Used to enforce per-item returnable limits in the partial-return modal.
+const returnedByReceiptAndItem = useMemo(()=>{
+  const m = {};
+  // Build return_id → receipt_no lookup
+  const retIdToReceipt = {};
+  (salesReturns||[]).forEach(r => {
+    if(r && r.id && r.receipt_no) retIdToReceipt[r.id] = r.receipt_no;
+  });
+  (allReturnItems||[]).forEach(ri => {
+    const receipt = retIdToReceipt[ri.return_id];
+    if(!receipt) return;
+    const itemKey = ri.product_id ? String(ri.product_id) : ("misc:" + (ri.product_name||"unknown"));
+    if(!m[receipt]) m[receipt] = {};
+    m[receipt][itemKey] = (m[receipt][itemKey]||0) + (parseInt(ri.quantity)||0);
+  });
+  return m;
+},[salesReturns, allReturnItems]);
+
+// Helper: how much of THIS item from THIS tx was already returned in prior returns
+const getAlreadyReturnedQty = (tx, item) => {
+  if(!tx || !tx.rn || !item) return 0;
+  // Strip _w suffix for weight items
+  const realId = (typeof item.id === "string" && item.id.includes("_w"))
+    ? item.id.split("_w")[0]
+    : item.id;
+  const isMisc = item._isMisc || (typeof item.id === "string" && item.id.startsWith("misc_"));
+  const itemKey = isMisc ? ("misc:" + (item.n || "unknown")) : String(realId);
+  return (returnedByReceiptAndItem[tx.rn] || {})[itemKey] || 0;
+};
+
+// Helper: prepare returnable items for the modal (filters out fully-returned items, adds metadata)
+const prepareReturnItems = (tx) => {
+  if(!tx || !tx.items) return [];
+  return tx.items.map(i => {
+    const alreadyReturned = getAlreadyReturnedQty(tx, i);
+    const maxReturnable = Math.max(0, (i.qty||0) - alreadyReturned);
+    return {...i, returnQty:0, reason:"", alreadyReturned, maxReturnable};
+  }).filter(i => i.maxReturnable > 0);
+};
+
 // Helper: get net sold qty for a product = total sold - total returned
 const getNetSoldQty = (productId) => {
   let sold = 0;
@@ -2139,8 +2400,15 @@ const getTxnReturnStatus = (tx) => {
   // Only consider actual refunds with positive amount
   if(totalRefund <= 0) return {status:"none", totalReturned:0, refundAmount:0};
   const isFullReturn = myReturns.some(r => r.return_type === "full");
+  // ━━━ NEW: Per-item exhaustion check ━━━
+  // If every item in the tx has been returned to its full sold qty → block as "full"
+  // This handles cases where invoice had discount/promo so amount-based check misses it.
+  const allItemsExhausted = (tx.items||[]).length > 0 && (tx.items||[]).every(i => {
+    const alreadyReturned = getAlreadyReturnedQty(tx, i);
+    return alreadyReturned >= (i.qty||0);
+  });
   // If refund matches OR EXCEEDS invoice total → treat as full
-  if(isFullReturn || (tx.tot > 0 && totalRefund >= tx.tot - 0.01)) {
+  if(isFullReturn || allItemsExhausted || (tx.tot > 0 && totalRefund >= tx.tot - 0.01)) {
     return {status:"full", totalReturned:totalRefund, refundAmount:totalRefund, returnCount:myReturns.length};
   }
   return {status:"partial", totalReturned:totalRefund, refundAmount:totalRefund, returnCount:myReturns.length};
@@ -3266,6 +3534,8 @@ const exportReconciliationReport = (mode) => {
 const saveNewInvoice = async () => {
   if(invSaving){console.warn("[INVOICE] Save already in progress, ignoring duplicate click");return}
   setInvSaving(true);
+  // ⚡ ATOMIC PROTECTION: track if invoice was saved, to rollback on later errors
+  let atomicInvoiceId = null;
   if(!invSup){sT("✗ "+(rtl?"اختر المورد":"Select supplier"),"err");setInvSaving(false);return}
   if(!invNo){sT("✗ "+(rtl?"رقم الفاتورة مطلوب":"Invoice number required"),"err");setInvSaving(false);return}
   const validRows = invRows.filter(r => (r.prodId || (r.bc && r.name)) && r.qty && parseInt(r.qty)>0);
@@ -3385,6 +3655,8 @@ const saveNewInvoice = async () => {
     
     // 1) Save invoice to DB (returns the new invoice with id)
     const savedInv = await DB.addInvoice(inv);
+    // ⚡ ATOMIC PROTECTION: track invoice ID so we can rollback if subsequent steps fail
+    if(savedInv?.id) atomicInvoiceId = savedInv.id;
     if(!savedInv || !savedInv.id){
       sT("✗ "+(rtl?"فشل حفظ الفاتورة في قاعدة البيانات — لم يتم تحديث المخزون":"Invoice save failed — stock NOT updated"),"err");
       setInvSaving(false);
@@ -3694,7 +3966,25 @@ const saveNewInvoice = async () => {
     }, 500);
   }catch(e){
     console.error("Invoice save error:",e);
-    sT("✗ "+(rtl?"فشل الحفظ: ":"Save failed: ")+e.message,"err");
+    
+    // ⚡ ATOMIC ROLLBACK: if invoice header was saved but a later step failed,
+    // delete the invoice + its items + its batches to prevent ghost/partial state
+    if(atomicInvoiceId){
+      console.warn("[INVOICE] ⚠️ Error after invoice save — rolling back invoice ID:",atomicInvoiceId);
+      try{
+        // Delete batches first (FK chain)
+        await sb.from("product_batches").delete().eq("invoice_id",atomicInvoiceId);
+        await sb.from("purchase_invoice_items").delete().eq("invoice_id",atomicInvoiceId);
+        await sb.from("purchase_invoices").delete().eq("id",atomicInvoiceId);
+        console.log("[INVOICE] ✓ Atomic rollback complete");
+        sT("✗ "+(rtl?"فشل الحفظ — تم إلغاء الفاتورة كاملة. حاول مرة أخرى":"Save failed — invoice rolled back. Try again")+": "+e.message,"err");
+      }catch(rollbackErr){
+        console.error("[INVOICE] ❌ Rollback failed:",rollbackErr);
+        sT("⚠️ "+(rtl?"خطأ خطير: فشل الحفظ والتراجع. تواصل مع الإدارة":"Critical: save failed AND rollback failed. Contact admin"),"err");
+      }
+    }else{
+      sT("✗ "+(rtl?"فشل الحفظ: ":"Save failed: ")+e.message,"err");
+    }
   }finally{setInvSaving(false)}
 };
 
@@ -4361,7 +4651,7 @@ const ttip={background:"#fff",border:"1px solid #e5e7eb",borderRadius:12,fontSiz
 
 // Using the same clean white CSS from the previous version
 // (abbreviated here — the full CSS string is the same as the white theme version)
-const S=`@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');:root{--w:#fff;--g50:#f9fafb;--g100:#f3f4f6;--g200:#e5e7eb;--g300:#d1d5db;--g400:#9ca3af;--g500:#6b7280;--g600:#4b5563;--g700:#374151;--g800:#1f2937;--g900:#111827;--blue:#2563eb;--blue50:#eff6ff;--blue100:#dbeafe;--green:#059669;--green50:#ecfdf5;--green100:#d1fae5;--org:#ea580c;--red:#dc2626;--red50:#fef2f2;--purple:#7c3aed;--amber:#d97706;--amber50:#fffbeb;--r:12px;--f:'Plus Jakarta Sans',sans-serif;--m:'JetBrains Mono',monospace;--shadow:0 1px 3px rgba(0,0,0,.08);--shadow2:0 4px 12px rgba(0,0,0,.1);--shadow3:0 10px 40px rgba(0,0,0,.12)}*{margin:0;padding:0;box-sizing:border-box}input[type=number]::-webkit-outer-spin-button,input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}input[type=number]{-moz-appearance:textfield}body,#root{font-family:var(--f);background:var(--g50);color:var(--g900);height:100vh;overflow:hidden}.app{display:flex;flex-direction:column;height:100vh;direction:${rtl?"rtl":"ltr"}}
+const S=`@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');:root{--w:#fff;--g50:#f9fafb;--g100:#f3f4f6;--g200:#e5e7eb;--g300:#d1d5db;--g400:#9ca3af;--g500:#6b7280;--g600:#4b5563;--g700:#374151;--g800:#1f2937;--g900:#111827;--blue:#2563eb;--blue50:#eff6ff;--blue100:#dbeafe;--green:#059669;--green50:#ecfdf5;--green100:#d1fae5;--org:#ea580c;--red:#dc2626;--red50:#fef2f2;--purple:#7c3aed;--amber:#d97706;--amber50:#fffbeb;--brand:#1E3A6F;--brand-dark:#142850;--brand-light:#E8EEF7;--brand-soft:#F0F4FA;--accent:#D32F2F;--accent-dark:#B71C1C;--accent-light:#FEEBEE;--brand-shadow:0 2px 8px rgba(30,58,111,0.08);--brand-shadow-lg:0 8px 24px rgba(30,58,111,0.12);--r:12px;--f:'Plus Jakarta Sans',sans-serif;--m:'JetBrains Mono',monospace;--shadow:0 1px 3px rgba(0,0,0,.08);--shadow2:0 4px 12px rgba(0,0,0,.1);--shadow3:0 10px 40px rgba(0,0,0,.12)}*{margin:0;padding:0;box-sizing:border-box}input[type=number]::-webkit-outer-spin-button,input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}input[type=number]{-moz-appearance:textfield}body,#root{font-family:var(--f);background:var(--g50);color:var(--g900);height:100vh;overflow:hidden}.app{display:flex;flex-direction:column;height:100vh;direction:${rtl?"rtl":"ltr"}}
 .login-wrap{height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#eff6ff 0%,#f0fdf4 50%,#fff7ed 100%)}.login-card{background:var(--w);border-radius:20px;padding:40px 36px;width:380px;box-shadow:var(--shadow3)}.login-logo{text-align:center;margin-bottom:28px}.login-logo h1{font-size:32px;font-weight:800}.login-logo h1 span{color:var(--blue)}.login-logo p{color:var(--g400);font-size:13px;margin-top:4px}.lf{margin-bottom:16px}.lf label{display:block;font-size:12px;font-weight:600;color:var(--g600);margin-bottom:6px}.lf input{width:100%;padding:12px 16px;background:var(--g50);border:1.5px solid var(--g200);border-radius:var(--r);color:var(--g900);font-size:14px;font-family:var(--f);outline:none}.lf input:focus{border-color:var(--blue);box-shadow:0 0 0 3px var(--blue50)}.login-btn{width:100%;padding:14px;background:var(--blue);border:none;border-radius:var(--r);color:var(--w);font-size:15px;font-weight:700;cursor:pointer;font-family:var(--f);margin-top:4px}.login-btn:hover{background:#1d4ed8}.login-err{color:var(--red);font-size:12px;text-align:center;margin-top:10px}
 .hdr{display:flex;align-items:center;justify-content:space-between;padding:10px 20px;background:var(--w);border-bottom:1px solid var(--g200);flex-shrink:0}.logo-a{display:flex;align-items:center;gap:10px}.logo-m{width:36px;height:36px;background:linear-gradient(135deg,var(--blue),var(--green));border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12px;color:var(--w)}.logo-t{font-size:18px;font-weight:800}.logo-t span{color:var(--blue)}.hdr-r{display:flex;align-items:center;gap:8px}.hb{display:flex;align-items:center;gap:4px;background:var(--g50);padding:6px 12px;border-radius:20px;border:1px solid var(--g200);cursor:pointer;font-family:var(--f);color:var(--g600);font-size:11px;font-weight:500}.hb:hover{border-color:var(--blue);color:var(--blue);background:var(--blue50)}.hb-blue{background:var(--blue50);border-color:var(--blue100);color:var(--blue)}.hb-red:hover{background:var(--red50);color:var(--red)}.db-badge{font-size:10px;color:var(--green);background:var(--green50);padding:3px 10px;border-radius:20px;font-weight:600;border:1px solid var(--green100);display:flex;align-items:center;gap:4px}.db-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:pu 2s ease infinite}
 .nav{display:flex;gap:2px;padding:0 20px;background:var(--w);border-bottom:1px solid var(--g200);flex-shrink:0}.nt{padding:10px 18px;font-size:14px;font-weight:600;color:var(--g400);background:none;border:none;cursor:pointer;border-bottom:2.5px solid transparent;font-family:var(--f)}.nt:hover{color:var(--g600)}.nt.a{color:var(--blue);border-bottom-color:var(--blue)}
@@ -4387,10 +4677,16 @@ const S=`@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans
 .inv-card{background:var(--w);border:1px solid var(--g200);border-radius:16px;padding:12px;margin-bottom:8px;cursor:pointer}.inv-card:hover{border-color:var(--blue);box-shadow:var(--shadow)}
 .toast{position:fixed;top:70px;${rtl?"left":"right"}:20px;padding:12px 20px;border-radius:var(--r);font-size:13px;font-weight:600;z-index:999999;animation:sIn .3s ease;box-shadow:var(--shadow3);max-width:90vw;word-wrap:break-word}.toast-ok{background:var(--green);color:var(--w)}.toast-err{background:var(--red);color:var(--w)}
 .bci{position:fixed;bottom:14px;${rtl?"left":"right"}:16px;padding:6px 14px;background:var(--w);border:1px solid var(--g200);border-radius:20px;font-size:11px;color:var(--g500);z-index:500;display:flex;align-items:center;gap:6px;box-shadow:var(--shadow)}.bcd{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pu 2s ease infinite}
-@keyframes sIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}@keyframes fIn{from{opacity:0}to{opacity:1}}@keyframes pu{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes sIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}@keyframes fIn{from{opacity:0}to{opacity:1}}@keyframes pu{0%,100%{opacity:1}50%{opacity:.3}}@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}@keyframes sInL{from{transform:translateX(-100%)}to{transform:translateX(0)}}@keyframes sInR{from{transform:translateX(100%)}to{transform:translateX(0)}}
 .recharts-text{fill:var(--g500)!important;font-size:10px!important;font-family:var(--f)!important}.recharts-cartesian-grid-horizontal line,.recharts-cartesian-grid-vertical line{stroke:var(--g100)!important}
 @media(max-width:768px){
-.hdr{padding:8px 12px}.logo-t{font-size:14px}.logo-m{width:30px;height:30px;font-size:10px}.hdr-r{gap:4px}.hb{padding:4px 8px;font-size:10px}.db-badge{font-size:9px;padding:2px 8px}
+.hdr{padding:8px 12px}.logo-t{font-size:14px}.logo-m{width:30px;height:30px;font-size:10px}.hdr-r{gap:4px}.hb{padding:4px 8px;font-size:10px}.db-badge{display:none}
+/* New nav: hamburger only, hide desktop buttons */
+.nav-modern{padding:8px 10px!important;gap:8px!important;justify-content:space-between}
+.nav-modern .nav-burger{display:flex!important;align-items:center;justify-content:center;min-width:44px;min-height:44px}
+.nav-modern .nav-btn-primary,.nav-modern .nav-btn-dropdown,.nav-modern .nav-btn-single,.nav-modern .nav-cmdk{display:none!important}
+.nav-modern>div[style*="width:1px"]{display:none!important}
+/* Old nav fallback (legacy) */
 .nav{padding:0 8px;overflow-x:auto;-webkit-overflow-scrolling:touch;gap:0}.nav::-webkit-scrollbar{height:0}.nt{padding:8px 12px;font-size:11px;white-space:nowrap;flex-shrink:0}
 .mn{flex-direction:column}.pp{min-height:40vh}.cp{width:100%;border-left:none;border-top:1px solid var(--g200);max-height:55vh}
 .pg{grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:6px;padding:8px}.pc{padding:10px 8px;border-radius:12px}.pe{font-size:22px}.pn{font-size:11px}.pp2{font-size:12px}
@@ -4399,20 +4695,27 @@ const S=`@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans
 .ch2{padding:10px 12px}.ch2 h3{font-size:13px}.ciw{max-height:150px}
 .csm{padding:10px 12px}.sr{font-size:12px}.sr.T{font-size:15px}
 .pbs{padding:8px 12px;gap:6px}.pb{padding:10px;font-size:11px}.pbi{font-size:16px}
-.md{min-width:auto;width:92vw;max-width:none;padding:20px;border-radius:16px;max-height:92vh}.md h2{font-size:16px}
-.ov{padding:10px;align-items:flex-start;padding-top:4vh}
-.rcpt{max-height:50vh}.ra{flex-direction:column;gap:6px}
+/* Modals: full-screen on mobile for better UX */
+.md{min-width:auto;width:100vw;max-width:none;padding:16px;border-radius:0;max-height:100vh;height:100vh;margin:0}.md h2{font-size:16px}
+.ov{padding:0;align-items:flex-start;padding-top:0}
+.rcpt{max-height:60vh}.ra{flex-direction:column;gap:6px}
 .dsh{padding:10px;gap:8px}
+/* Dashboard stat-grid: stack to 2 columns instead of 4-5 on mobile */
+.dsh>div[style*="grid-template-columns"]{grid-template-columns:repeat(2,1fr)!important;gap:8px!important}
 .ad{flex-direction:column}.ads{flex-direction:row;overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%;border-right:none;border-bottom:1px solid var(--g200);padding:8px;gap:4px}.ads::-webkit-scrollbar{height:0}.asb{white-space:nowrap;font-size:11px;padding:8px 12px}.ac{padding:10px;width:100%}
 .at{font-size:11px}.at th,.at td{padding:6px 8px}
 .tb{margin-bottom:8px;border-radius:12px}.tbh{padding:8px 12px;font-size:12px}
 .sf label{font-size:11px}.sf input{padding:8px 12px;font-size:12px}.svb{font-size:12px;padding:10px}
 .dc{padding:10px}.dcl{font-size:9px}.dcv{font-size:16px}
 .toast{top:auto;bottom:20px;${rtl?"left":"right"}:10px;font-size:12px;padding:10px 16px}
-.login-card{width:90vw;max-width:360px;padding:28px 24px}.login-logo h1{font-size:26px}
+.login-card{width:92vw;max-width:380px;padding:28px 24px}.login-logo h1{font-size:26px}
 .bci{bottom:8px;${rtl?"left":"right"}:8px;font-size:10px;padding:4px 10px}
 .inv-row{flex-wrap:wrap}.inv-row select,.inv-row input{min-width:80px}
-.pf input,.pf select{font-size:14px;padding:12px 14px}
+.pf input,.pf select{font-size:16px;padding:12px 14px;min-height:44px}
+/* Touch targets: minimum 44px tap area for buttons */
+button{min-height:36px}
+/* Make tables horizontally scrollable on mobile */
+.tb table,table.at{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;white-space:nowrap}
 }
 @media(max-width:480px){
 .pg{grid-template-columns:repeat(3,1fr);gap:4px;padding:6px}.pc{padding:8px 6px}.pe{font-size:18px}.pn{font-size:10px}.pp2{font-size:11px}
@@ -4435,39 +4738,193 @@ return(<><style>{S}</style><div className="app">
     if(!confirm(msg))return;
   }
   setLI(false);setCU(null);setLU("");setLP("");
+  try{localStorage.removeItem("3045_session")}catch{}
 }}>🚪 {t.logout}</button></div></header>
 
-<nav className="nav" style={{display:"flex",flexDirection:"column",gap:0}}>
-{/* ── PRIMARY: Cashier Tabs (like screenshot) ── */}
-<div style={{display:"flex",gap:6,padding:"10px 16px",background:"#fff",borderBottom:"1px solid #e2e8f0",overflowX:"auto"}}>
-{[
-{id:"home",l:rtl?"الرئيسية":"Home",i:"🏠"},
-{id:"sale",l:rtl?"نقطة البيع":"POS",i:"🛒"},
-{id:"orders",l:rtl?"الطلبات":"Orders",i:"📋",badge:(held.length||0)+(onlineOrders.filter(o=>o.status==="pending").length||0)},
-{id:"cashMgmt",l:rtl?"إدارة النقد":"Cash Management",i:"💰"},
-{id:"stockCheck",l:rtl?"كميات المنتجات":"Product Quantities",i:"📦"},
-{id:"regClose",l:rtl?"إغلاق الصندوق":"Register Closures",i:"🔒",dot:!!activeShift},
-{id:"shiftLedger",l:rtl?"سجل الورديات":"Shift Ledger",i:"📒"},
-{id:"opsManager",l:rtl?"مدير التشغيل":"Ops Manager",i:"📋"},
-{id:"onlineOrders",l:rtl?"طلبات أونلاين":"Online Orders",i:"🛵"},
-{id:"expiryTracker",l:rtl?"متابعة الصلاحية":"Expiry Tracker",i:"📅"},
-{id:"ashyaiProducts",l:rtl?"منتجات أشيائي":"Ashya2i Products",i:"🛵"},
-{id:"cigInvoices",l:rtl?"مبيعات الدخان":"Tobacco Sales",i:"🚬"},
-{id:"prodSalesLookup",l:rtl?"بحث مبيعات منتج":"Product Sales",i:"🔍"},
-{id:"posReturn",l:rtl?"مرتجع":"Return",i:"↩️"},
-].map(b=><button key={b.id} onClick={()=>setTab(b.id)} style={{padding:"8px 18px",border:tab===b.id?"2px solid #1e40af":"1.5px solid #d1d5db",borderRadius:8,background:tab===b.id?"#eff6ff":"#fff",color:tab===b.id?"#1e40af":"#374151",fontSize:14,fontWeight:700,cursor:"pointer",fontFamily:"var(--f)",whiteSpace:"nowrap",position:"relative",transition:"all .15s"}}>{b.i} {b.l}{b.badge>0&&<span style={{position:"absolute",top:-4,right:rtl?"auto":-4,left:rtl?-4:"auto",background:"#dc2626",color:"#fff",fontSize:8,fontWeight:800,borderRadius:"50%",width:16,height:16,display:"flex",alignItems:"center",justifyContent:"center"}}>{b.badge}</span>}{b.dot&&<span style={{position:"absolute",top:-2,right:rtl?"auto":-2,left:rtl?-2:"auto",width:8,height:8,background:"#059669",borderRadius:"50%",border:"2px solid #fff"}}/>}</button>)}
-</div>
-{/* ── SECONDARY: Manager/Admin Tabs ── */}
-<div style={{display:"flex",gap:2,padding:"4px 16px",background:"#f8fafc",borderBottom:"1px solid #e2e8f0",overflowX:"auto",flexWrap:"wrap"}}>
-{hasP("dashboard")&&<button className={"nt "+(tab==="dashboard"?"a":"")} onClick={()=>setTab("dashboard")}>📊 {t.dashboard}</button>}
-{hasP("dashboard")&&<button className={"nt "+(tab==="analytics"?"a":"")} onClick={()=>setTab("analytics")}>🧠 {rtl?"التحليلات":"Analytics"}</button>}
-{hasP("dashboard")&&prods.some(p=>p.cat==="cigarettes")&&<button className={"nt "+(tab==="tobacco"?"a":"")} onClick={()=>setTab("tobacco")}>🚬 {rtl?"التبغ":"Tobacco"}</button>}
-{hasP("sales_view")&&<button className={"nt "+(tab==="sales"?"a":"")} onClick={()=>setTab("sales")}>📋 {t.salesView}</button>}
-{hasP("hr")&&<button className={"nt "+(tab==="hr"?"a":"")} onClick={()=>setTab("hr")}>🏢 {t.hr}</button>}
-{hasP("finance")&&<button className={"nt "+(tab==="finance"?"a":"")} onClick={()=>setTab("finance")}>💰 {t.finance}</button>}
-{(cu.role==="admin"||cu.role==="manager")&&<button className={"nt "+(tab==="admin"?"a":"")} onClick={()=>setTab("admin")}>⚙️ {t.admin}</button>}
-</div>
+<nav ref={navRef} className="nav nav-modern" style={{display:"flex",alignItems:"center",gap:6,padding:"8px 12px",background:"#fff",borderBottom:"1.5px solid #e2e8f0",overflowX:"auto",position:"relative",flexWrap:"nowrap"}}>
+
+{/* Mobile hamburger */}
+<button className="nav-burger" onClick={()=>setMobileMenuOpen(true)} style={{display:"none",padding:"8px 12px",background:"#1e40af",border:"none",borderRadius:8,color:"#fff",fontSize:18,fontWeight:800,cursor:"pointer",fontFamily:"var(--f)",flexShrink:0,minWidth:44,minHeight:44}}>☰</button>
+
+{/* ─── Build the unified nav config and render ─── */}
+{(()=>{
+  const isMgr=cu.role==="admin"||cu.role==="manager";
+  const isAdmin=cu.role==="admin";
+  const cfg=[
+    {type:"primary",id:"home",l:rtl?"الرئيسية":"Home",i:"🏠"},
+    {type:"primary",id:"sale",l:rtl?"نقطة البيع":"POS",i:"🛒",hl:true},
+    {type:"group",key:"daily",label:rtl?"المبيعات اليومية":"Daily Sales",icon:"📋",color:"#1e40af",items:[
+      {id:"orders",l:rtl?"الطلبات":"Orders",i:"📋",badge:(held.length||0)+(onlineOrders.filter(o=>o.status==="pending").length||0)},
+      {id:"posReturn",l:rtl?"المرتجعات":"Returns",i:"↩️"},
+      {id:"sales",l:rtl?"سجل المبيعات":"Sales History",i:"📋",show:hasP("sales_view")},
+    ]},
+    {type:"group",key:"cash",label:rtl?"الصندوق والورديات":"Cash & Shifts",icon:"💵",color:"#059669",items:[
+      {id:"cashMgmt",l:rtl?"إدارة النقد":"Cash Management",i:"💰"},
+      {id:"regClose",l:rtl?"فتح/إغلاق الصندوق":"Open/Close Register",i:"🔒",dot:!!activeShift},
+      {id:"shiftLedger",l:rtl?"سجل الورديات":"Shift Ledger",i:"📒"},
+      {atab:"reconcile",l:rtl?"مطابقة الصندوق":"Reconciliation",i:"🧮",show:isMgr},
+    ]},
+    {type:"group",key:"inv",label:rtl?"المخزون":"Inventory",icon:"📦",color:"#d97706",items:[
+      {id:"stockCheck",l:rtl?"كميات المنتجات":"Product Quantities",i:"📦"},
+      {id:"expiryTracker",l:rtl?"متابعة الصلاحية":"Expiry Tracker",i:"📅"},
+      {id:"prodSalesLookup",l:rtl?"بحث مبيعات منتج":"Product Sales Lookup",i:"🔍"},
+      {atab:"inventory",l:rtl?"إدارة المنتجات":"Manage Products",i:"✏️",show:hasP("inventory")},
+      {atab:"stocktake",l:rtl?"جرد البضاعة":"Stocktake",i:"📋",show:hasP("inventory")},
+      {atab:"prodTracker",l:rtl?"تتبع المنتج":"Product Tracker",i:"🔎",show:hasP("inventory")},
+      {atab:"pricereview",l:rtl?"مراجعة الأسعار":"Price Review",i:"💰",show:hasP("inventory")},
+      {atab:"categories",l:rtl?"إدارة الفئات":"Categories",i:"🏷️",show:isAdmin},
+      {atab:"packages",l:rtl?"الحزم والعروض":"Packages & Promos",i:"📦",show:isAdmin},
+    ]},
+    {type:"group",key:"purch",label:rtl?"المشتريات والموردون":"Purchasing",icon:"🏭",color:"#be185d",show:hasP("purchases")||isMgr,items:[
+      {atab:"purchases",l:rtl?"فواتير الشراء":"Purchase Invoices",i:"🧾"},
+      {atab:"vendors",l:rtl?"الموردون":"Vendors",i:"🏭"},
+      {atab:"bulkassign",l:rtl?"ربط جماعي للموردين":"Bulk Vendor Assign",i:"📦",show:isAdmin},
+    ]},
+    {type:"group",key:"deliv",label:rtl?"التوصيل والقنوات":"Delivery & Channels",icon:"🚚",color:"#ea580c",items:[
+      {id:"onlineOrders",l:rtl?"طلبات أونلاين":"Online Orders",i:"🛵"},
+      {id:"ashyaiProducts",l:rtl?"منتجات أشيائي":"Ashya2i Products",i:"🛵"},
+      {id:"cigInvoices",l:rtl?"مبيعات الدخان":"Tobacco Sales",i:"🚬"},
+      {id:"opsManager",l:rtl?"مدير التشغيل":"Ops Manager",i:"📋"},
+    ]},
+    {type:"group",key:"reports",label:rtl?"التقارير والتحليلات":"Reports",icon:"📊",color:"#7c3aed",show:hasP("dashboard")||hasP("sales_view")||isMgr,items:[
+      {id:"dashboard",l:rtl?"لوحة التحكم":"Dashboard",i:"📊",show:hasP("dashboard")},
+      {id:"analytics",l:rtl?"التحليلات المتقدمة":"Advanced Analytics",i:"🧠",show:hasP("dashboard")},
+      {id:"tobacco",l:rtl?"تقرير التبغ":"Tobacco Report",i:"🚬",show:hasP("dashboard")&&prods.some(p=>p.cat==="cigarettes")},
+      {atab:"audit",l:rtl?"التدقيق الذكي":"Smart Audit",i:"🔍",show:isAdmin},
+      {id:"systemHealth",l:rtl?"صحة النظام":"System Health",i:"🛡️",show:isAdmin},
+      {id:"purchaseSuggestions",l:rtl?"ما يجب شراؤه":"What to Buy",i:"🛒",show:hasP("dashboard")||isAdmin},
+    ]},
+    {type:"group",key:"people",label:rtl?"الموظفون والعملاء":"People",icon:"👥",color:"#0891b2",show:hasP("hr")||hasP("loyalty")||isAdmin,items:[
+      {id:"hr",l:rtl?"الموارد البشرية":"HR & Payroll",i:"🏢",show:hasP("hr")},
+      {atab:"loyalty",l:rtl?"برنامج الولاء":"Loyalty Program",i:"⭐",show:hasP("loyalty")},
+      {atab:"users",l:rtl?"إدارة المستخدمين":"User Management",i:"👥",show:isAdmin},
+    ]},
+    {type:"single",id:"finance",l:rtl?"المالية":"Finance",i:"💰",color:"#dc2626",show:hasP("finance")},
+    {type:"single-atab",atab:"settings",l:rtl?"الإعدادات":"Settings",i:"⚙️",color:"#475569",show:isMgr},
+  ];
+  // Filter visibility
+  const visible=cfg.filter(c=>{
+    if(c.show===false)return false;
+    if(c.show===true||c.show===undefined){
+      if(c.type==="group"){
+        const visibleItems=(c.items||[]).filter(it=>it.show!==false);
+        return visibleItems.length>0;
+      }
+      return true;
+    }
+    return c.show;
+  });
+  // Stash globally so Ctrl+K can use the same source
+  window.__navConfig=visible;
+  
+  // Smart navigate helper
+  const go=(it)=>{
+    if(it.id){setTab(it.id)}
+    else if(it.atab){setTab("admin");setAT(it.atab)}
+    setNavOpenMenu(null);
+    setMobileMenuOpen(false);
+  };
+  // Active state checker
+  const isActive=(it)=>{
+    if(it.id)return tab===it.id;
+    if(it.atab)return tab==="admin"&&atab===it.atab;
+    return false;
+  };
+  
+  return visible.map((c,idx)=>{
+    if(c.type==="primary"){
+      const active=tab===c.id;
+      return <button key={c.id} onClick={()=>go(c)} className="nav-btn nav-btn-primary" style={{padding:"8px 14px",border:active?"2px solid #1e40af":"1.5px solid #d1d5db",borderRadius:9,background:active?(c.hl?"linear-gradient(180deg,#10b981,#059669)":"#eff6ff"):(c.hl?"linear-gradient(180deg,#10b981,#059669)":"#fff"),color:active&&!c.hl?"#1e40af":(c.hl?"#fff":"#374151"),fontSize:13,fontWeight:800,cursor:"pointer",fontFamily:"var(--f)",whiteSpace:"nowrap",position:"relative",transition:"all .15s",flexShrink:0,boxShadow:c.hl?"0 2px 6px rgba(16,185,129,.3)":"none",minHeight:38}}>{c.i} {c.l}</button>;
+    }
+    if(c.type==="single"){
+      const active=tab===c.id;
+      return <button key={c.id} onClick={()=>go(c)} className="nav-btn nav-btn-single" style={{padding:"8px 14px",border:active?"2px solid "+c.color:"1.5px solid #d1d5db",borderRadius:9,background:active?c.color+"15":"#fff",color:active?c.color:"#374151",fontSize:13,fontWeight:800,cursor:"pointer",fontFamily:"var(--f)",whiteSpace:"nowrap",transition:"all .15s",flexShrink:0,minHeight:38}}>{c.i} {c.l}</button>;
+    }
+    if(c.type==="single-atab"){
+      const active=tab==="admin"&&atab===c.atab;
+      return <button key={c.atab} onClick={()=>go(c)} className="nav-btn nav-btn-single" style={{padding:"8px 14px",border:active?"2px solid "+c.color:"1.5px solid #d1d5db",borderRadius:9,background:active?c.color+"15":"#fff",color:active?c.color:"#374151",fontSize:13,fontWeight:800,cursor:"pointer",fontFamily:"var(--f)",whiteSpace:"nowrap",transition:"all .15s",flexShrink:0,minHeight:38}}>{c.i} {c.l}</button>;
+    }
+    if(c.type==="group"){
+      const itemsVisible=c.items.filter(it=>it.show!==false);
+      if(itemsVisible.length===0)return null;
+      const isOpen=navOpenMenu===c.key;
+      const activeInGroup=itemsVisible.some(isActive);
+      const totalBadge=itemsVisible.reduce((s,it)=>s+(it.badge||0),0);
+      const hasDot=itemsVisible.some(it=>it.dot);
+      return <div key={c.key} style={{position:"relative",flexShrink:0}}>
+        <button onClick={()=>setNavOpenMenu(isOpen?null:c.key)} className="nav-btn nav-btn-dropdown" style={{padding:"8px 14px",border:activeInGroup?"2px solid "+c.color:"1.5px solid #d1d5db",borderRadius:9,background:activeInGroup?c.color+"15":"#fff",color:activeInGroup?c.color:"#374151",fontSize:13,fontWeight:800,cursor:"pointer",fontFamily:"var(--f)",whiteSpace:"nowrap",position:"relative",display:"flex",alignItems:"center",gap:5,transition:"all .15s",minHeight:38}}>
+          <span>{c.icon}</span>
+          <span>{c.label}</span>
+          <span style={{fontSize:9,opacity:.7,transition:"transform .15s",transform:isOpen?"rotate(180deg)":"rotate(0deg)",display:"inline-block"}}>▼</span>
+          {totalBadge>0&&<span style={{position:"absolute",top:-5,[rtl?"left":"right"]:-5,background:"#dc2626",color:"#fff",fontSize:9,fontWeight:800,borderRadius:"50%",minWidth:18,height:18,padding:"0 4px",display:"flex",alignItems:"center",justifyContent:"center",border:"2px solid #fff"}}>{totalBadge}</span>}
+          {hasDot&&!totalBadge&&<span style={{position:"absolute",top:-2,[rtl?"left":"right"]:-2,width:9,height:9,background:"#10b981",borderRadius:"50%",border:"2px solid #fff"}}/>}
+        </button>
+        {isOpen&&<div style={{position:"absolute",top:"calc(100% + 6px)",[rtl?"right":"left"]:0,minWidth:240,background:"#fff",border:"1.5px solid "+c.color,borderRadius:12,boxShadow:"0 12px 32px rgba(0,0,0,.15)",zIndex:200,padding:6,animation:"sIn .15s ease"}}>
+          <div style={{padding:"8px 12px",fontSize:11,fontWeight:800,color:c.color,letterSpacing:.5,textTransform:"uppercase",borderBottom:"1px solid #f1f5f9",marginBottom:4}}>{c.icon} {c.label}</div>
+          {itemsVisible.map((it,i2)=>{
+            const active=isActive(it);
+            return <button key={it.id||it.atab||i2} onClick={()=>go(it)} style={{width:"100%",padding:"10px 12px",border:"none",borderRadius:8,background:active?c.color+"15":"transparent",color:active?c.color:"#1e293b",fontSize:13,fontWeight:active?800:600,cursor:"pointer",fontFamily:"var(--f)",textAlign:rtl?"right":"left",display:"flex",alignItems:"center",gap:10,position:"relative",transition:"background .1s"}} onMouseEnter={e=>{if(!active)e.currentTarget.style.background="#f8fafc"}} onMouseLeave={e=>{if(!active)e.currentTarget.style.background="transparent"}}>
+              <span style={{fontSize:18,width:24,textAlign:"center"}}>{it.i}</span>
+              <span style={{flex:1}}>{it.l}</span>
+              {it.badge>0&&<span style={{background:"#dc2626",color:"#fff",fontSize:10,fontWeight:800,borderRadius:10,minWidth:20,height:18,padding:"0 6px",display:"flex",alignItems:"center",justifyContent:"center"}}>{it.badge}</span>}
+              {it.dot&&<span style={{width:8,height:8,background:"#10b981",borderRadius:"50%"}}/>}
+              {active&&<span style={{fontSize:14,color:c.color,fontWeight:800}}>✓</span>}
+            </button>;
+          })}
+        </div>}
+      </div>;
+    }
+    return null;
+  });
+})()}
+
+{/* Ctrl+K hint button (desktop) */}
+<button className="nav-cmdk" onClick={()=>setCmdkOpen(true)} title={rtl?"بحث سريع (Ctrl+K)":"Quick search (Ctrl+K)"} style={{padding:"8px 10px",background:"#f1f5f9",border:"1.5px solid #cbd5e1",borderRadius:9,color:"#64748b",fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"var(--f)",whiteSpace:"nowrap",display:"flex",alignItems:"center",gap:5,flexShrink:0,marginInlineStart:"auto",minHeight:38}}>
+  <span style={{fontSize:14}}>🔍</span>
+  <span>Ctrl+K</span>
+</button>
+
 </nav>
+
+{/* ═══ Mobile Slide-Out Drawer ═══ */}
+{mobileMenuOpen&&<div onClick={()=>setMobileMenuOpen(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:998,backdropFilter:"blur(4px)",animation:"fIn .2s"}}>
+<div onClick={e=>e.stopPropagation()} style={{position:"fixed",top:0,[rtl?"right":"left"]:0,bottom:0,width:300,maxWidth:"88vw",background:"#fff",zIndex:999,overflowY:"auto",boxShadow:rtl?"-12px 0 32px rgba(0,0,0,.2)":"12px 0 32px rgba(0,0,0,.2)",animation:rtl?"sInR .25s ease":"sInL .25s ease"}}>
+<div style={{padding:"16px 18px",background:"linear-gradient(180deg,#0f172a,#1e293b)",color:"#fff",display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,zIndex:2}}>
+  <div>
+    <div style={{fontSize:16,fontWeight:900}}>3045 Supermarket</div>
+    <div style={{fontSize:11,color:"#94a3b8",marginTop:3}}>👤 {cu?.fa||cu?.fn}</div>
+  </div>
+  <button onClick={()=>setMobileMenuOpen(false)} style={{width:36,height:36,borderRadius:"50%",border:"1px solid rgba(255,255,255,.2)",background:"rgba(255,255,255,.1)",color:"#fff",fontSize:16,fontWeight:800,cursor:"pointer"}}>✕</button>
+</div>
+<div style={{padding:"10px 8px"}}>
+{(()=>{
+  const items=[];
+  (window.__navConfig||[]).forEach(c=>{
+    if(c.type==="primary"||c.type==="single"||c.type==="single-atab"){
+      items.push({...c,_kind:"item"});
+    }else if(c.type==="group"){
+      items.push({_kind:"sep",label:c.label,icon:c.icon,color:c.color});
+      (c.items||[]).filter(it=>it.show!==false).forEach(it=>items.push({...it,_kind:"item",_groupColor:c.color}));
+    }
+  });
+  const isActive=(it)=>{if(it.id)return tab===it.id;if(it.atab)return tab==="admin"&&atab===it.atab;return false};
+  const go=(it)=>{if(it.id){setTab(it.id)}else if(it.atab){setTab("admin");setAT(it.atab)};setMobileMenuOpen(false)};
+  return items.map((it,idx)=>{
+    if(it._kind==="sep"){
+      return <div key={"sep_"+idx} style={{padding:"14px 12px 6px",fontSize:10,fontWeight:800,color:it.color||"#94a3b8",letterSpacing:1.2,borderTop:idx>0?"1px solid #f1f5f9":"none",marginTop:idx>0?6:0}}>{it.icon} {it.label}</div>;
+    }
+    const active=isActive(it);
+    return <button key={(it.id||it.atab||idx)} onClick={()=>go(it)} style={{width:"100%",padding:"12px 12px",border:"none",borderRadius:10,background:active?(it._groupColor?it._groupColor+"15":"#eff6ff"):"transparent",color:active?(it._groupColor||"#1e40af"):"#1e293b",fontSize:14,fontWeight:active?800:600,cursor:"pointer",fontFamily:"var(--f)",textAlign:rtl?"right":"left",display:"flex",alignItems:"center",gap:12,marginBottom:2,minHeight:46,position:"relative"}}>
+      <span style={{fontSize:20,width:28,textAlign:"center"}}>{it.i||it.icon}</span>
+      <span style={{flex:1}}>{it.l}</span>
+      {it.badge>0&&<span style={{background:"#dc2626",color:"#fff",fontSize:10,fontWeight:800,borderRadius:10,minWidth:20,height:20,padding:"0 6px",display:"flex",alignItems:"center",justifyContent:"center"}}>{it.badge}</span>}
+      {it.dot&&<span style={{width:9,height:9,background:"#10b981",borderRadius:"50%"}}/>}
+    </button>;
+  });
+})()}
+</div>
+</div>
+</div>}
 </>}
 
 <div className="mn">
@@ -4501,6 +4958,81 @@ return<div style={{flex:1,overflowY:"auto",padding:16,display:"flex",flexDirecti
 <div style={{fontSize:13,opacity:.7,marginTop:2}}>{cu.role==="admin"?t.adminR:cu.role==="manager"?t.manager:t.cashier} · {new Date().toLocaleDateString(rtl?"ar":"en-US",{weekday:"long",month:"long",day:"numeric"})}</div>
 </div>
 </div></div>
+
+{/* Manager Quick Alerts - High Priority Card */}
+{(()=>{
+  const alerts=[];
+  
+  // Urgent purchase alerts
+  const today14=new Date();today14.setHours(0,0,0,0);
+  const cutoff14=new Date(today14.getTime()-14*86400000);
+  const productSales={};
+  txns.filter(t=>{try{return new Date(t.ts)>=cutoff14&&t.voidStatus!=="voided"}catch{return false}})
+    .forEach(t=>(t.items||[]).forEach(i=>{
+      if(!i.id||(typeof i.id==="string"&&i.id.startsWith("misc_")))return;
+      const realId=typeof i.id==="string"&&i.id.includes("_w")?i.id.split("_w")[0]:i.id;
+      productSales[realId]=(productSales[realId]||0)+(i.qty||0);
+    }));
+  
+  let urgentBuy=0;
+  prods.forEach(p=>{
+    const sold14d=productSales[p.id]||0;
+    if(sold14d===0)return;
+    const dailyAvg=sold14d/14;
+    const daysCoverage=dailyAvg>0?Math.floor((p.s||0)/dailyAvg):999;
+    if(daysCoverage<=3)urgentBuy++;
+  });
+  
+  // Expiry alerts
+  let expired=0,d7=0;
+  prods.filter(p=>p.exp&&p.s>0).forEach(p=>{
+    try{
+      const exp=new Date(p.exp);exp.setHours(0,0,0,0);
+      const days=Math.ceil((exp-today14)/86400000);
+      if(days<0)expired++;
+      else if(days<=7)d7++;
+    }catch{}
+  });
+  
+  // Low stock (out of stock)
+  const outOfStock=prods.filter(p=>p.s<=0).length;
+  
+  // Stale shifts
+  const staleShifts=cashShifts.filter(s=>{
+    if(s.status!=="open")return false;
+    try{return new Date()-new Date(s.shift_start)>12*3600000}catch{return false}
+  }).length;
+  
+  if(urgentBuy>0)alerts.push({icon:"🛒",label:rtl?"شراء عاجل":"Urgent Buy",value:urgentBuy,color:"#dc2626",bg:"#fef2f2",tab:"purchaseSuggestions"});
+  if(expired>0)alerts.push({icon:"❌",label:rtl?"منتهي":"Expired",value:expired,color:"#dc2626",bg:"#fef2f2",tab:"expiryTracker"});
+  if(d7>0)alerts.push({icon:"⚠️",label:rtl?"ينتهي بأسبوع":"Expires 7d",value:d7,color:"#ea580c",bg:"#fff7ed",tab:"expiryTracker"});
+  if(outOfStock>0)alerts.push({icon:"📦",label:rtl?"نفد المخزون":"Out of Stock",value:outOfStock,color:"#9a3412",bg:"#fff7ed",tab:"stockCheck"});
+  if(staleShifts>0)alerts.push({icon:"⏱️",label:rtl?"وردية قديمة":"Stale Shift",value:staleShifts,color:"#dc2626",bg:"#fef2f2",tab:"systemHealth"});
+  
+  // Show all-good message if no alerts
+  if(alerts.length===0)return <div style={{background:"linear-gradient(135deg,#ecfdf5,#d1fae5)",border:"2px solid #6ee7b7",borderRadius:18,padding:"18px 22px",display:"flex",alignItems:"center",gap:16}}>
+    <div style={{fontSize:36}}>✅</div>
+    <div>
+      <div style={{fontSize:16,fontWeight:800,color:"#065f46"}}>{rtl?"كل شيء على ما يرام":"All systems healthy"}</div>
+      <div style={{fontSize:12,color:"#047857",marginTop:2}}>{rtl?"لا توجد تنبيهات تستدعي اهتمامك الآن":"No alerts requiring your attention"}</div>
+    </div>
+  </div>;
+  
+  return <div style={{background:"linear-gradient(135deg,#fffbeb,#fef3c7)",border:"2px solid #fcd34d",borderRadius:18,padding:"16px 18px"}}>
+    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+      <div style={{fontSize:20}}>🚨</div>
+      <div style={{fontSize:15,fontWeight:800,color:"#92400e"}}>{rtl?"تنبيهات تحتاج انتباهك":"Alerts Need Your Attention"}</div>
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(120px, 1fr))",gap:8}}>
+      {alerts.map((a,i)=><div key={i} onClick={()=>setTab(a.tab)} style={{cursor:"pointer",background:a.bg,border:"1.5px solid "+a.color+"33",borderRadius:12,padding:"12px 10px",textAlign:"center",transition:"transform 0.2s"}}>
+        <div style={{fontSize:22,marginBottom:4}}>{a.icon}</div>
+        <div style={{fontSize:24,fontWeight:800,color:a.color,fontFamily:"var(--m)",lineHeight:1}}>{a.value}</div>
+        <div style={{fontSize:10,color:a.color,marginTop:4,fontWeight:600}}>{a.label}</div>
+      </div>)}
+    </div>
+    <div style={{textAlign:"center",fontSize:10,color:"#92400e",marginTop:8,opacity:0.7}}>{rtl?"اضغط على البطاقة للتفاصيل":"Tap card for details"}</div>
+  </div>;
+})()}
 
 {/* Weather + Date & Time Card */}
 {(()=>{
@@ -5746,11 +6278,11 @@ return<div style={{flex:1,overflowY:"auto",padding:16}}>
 </div>
 
 {/* ─── Search / Barcode bar (BIG) ─── */}
-<div style={{padding:"10px 14px",background:"#fff",borderBottom:"2px solid #e2e8f0",display:"flex",gap:8,position:"relative",flexShrink:0,zIndex:5}}>
+<div ref={posSearchRef} style={{padding:"10px 14px",background:"#fff",borderBottom:"2px solid #e2e8f0",display:"flex",gap:8,position:"relative",flexShrink:0,zIndex:5}}>
   <select value={cat} onChange={e=>{setCat(e.target.value);setPosDropdownClosed(false);setPosPage(0)}} style={{padding:"0 14px",background:cat!=="all"?"#dbeafe":"#f1f5f9",border:"2px solid "+(cat!=="all"?"#3b82f6":"#cbd5e1"),borderRadius:12,fontSize:14,fontWeight:800,color:cat!=="all"?"#1e40af":"#475569",cursor:"pointer",fontFamily:"var(--f)",outline:"none",minWidth:130,height:54}}>
     {CATS_ALL.map(c=>{const cnt=c.id==="all"?prods.length:prods.filter(p=>p.cat===c.id).length;return <option key={c.id} value={c.id}>{c.i} {t[c.k]||c.id}{cnt>0?` (${cnt})`:""}</option>})}
   </select>
-  <div style={{flex:1,position:"relative"}} ref={posSearchRef}>
+  <div style={{flex:1,position:"relative"}}>
     <span style={{position:"absolute",[rtl?"right":"left"]:18,top:"50%",transform:"translateY(-50%)",fontSize:24,color:"#3b82f6",pointerEvents:"none"}}>🔍</span>
     <input
       autoFocus
@@ -7297,8 +7829,29 @@ return<table className="at"><thead><tr>
 {!activeShift?<div style={{background:"#fffbeb",border:"2px dashed #fcd34d",borderRadius:16,padding:24,textAlign:"center",marginBottom:16}}>
 <div style={{fontSize:40,marginBottom:8}}>🔓</div>
 <div style={{fontSize:16,fontWeight:700,color:"#92400e",marginBottom:8}}>{rtl?"لا يوجد وردية مفتوحة":"No Active Shift"}</div>
-<div style={{fontSize:12,color:"#6b7280",marginBottom:14}}>{rtl?"افتح وردية جديدة لبدء البيع":"Open a new shift to start selling"}</div>
-<button style={{padding:"14px 28px",background:"#059669",border:"none",borderRadius:12,color:"#fff",fontSize:14,fontWeight:800,cursor:"pointer",fontFamily:"var(--f)"}} onClick={async()=>{const ob=prompt(rtl?"الرصيد الافتتاحي (JD)":"Opening Balance (JD)","50");if(!ob)return;const s={user_id:cu?.id,cashier_name:cu?.fn,shift_date:new Date().toISOString().slice(0,10),shift_start:new Date().toISOString(),opening_balance:parseFloat(ob)||50,status:"open"};try{const r=await DB.openShift(s);if(r){setActiveShift(r);setCashShifts(p=>[r,...p]);setTab("sale");try{await DB.clockIn(cu?.id);sT("✓ "+(rtl?"بدأت الوردية وتم تسجيل الحضور":"Shift opened & checked in"),"ok")}catch{sT("✓ "+(rtl?"بدأت الوردية":"Shift opened"),"ok")}}}catch(e){console.error(e)}}}>🟢 {rtl?"فتح وردية":"Open Shift"}</button>
+<div style={{fontSize:12,color:"#6b7280",marginBottom:10}}>{rtl?"افتح وردية جديدة لبدء البيع":"Open a new shift to start selling"}</div>
+<div style={{display:"inline-flex",alignItems:"center",gap:8,padding:"8px 16px",background:"#dbeafe",border:"1.5px solid #3b82f6",borderRadius:10,marginBottom:14}}>
+<span style={{fontSize:18}}>💰</span>
+<span style={{fontSize:13,fontWeight:800,color:"#1e40af"}}>{rtl?"نقطة الصفر المتفق عليها: 100 JD":"Agreed zero point: 100 JD"}</span>
+</div>
+<button style={{padding:"14px 28px",background:"#059669",border:"none",borderRadius:12,color:"#fff",fontSize:14,fontWeight:800,cursor:"pointer",fontFamily:"var(--f)"}} onClick={async()=>{
+const FLOAT=100; // نقطة الصفر المتفق عليها
+const isAdmin=cu?.role==="admin"||cu?.role==="manager";
+let opening=FLOAT;
+if(isAdmin){
+  // الأدمن فقط يستطيع تغيير القيمة (في حالات استثنائية)
+  const ob=prompt(rtl?`الرصيد الافتتاحي بالدينار\n\n⚠️ القيمة المتفق عليها: ${FLOAT} JD\n(لا تغيّر إلا في حالة استثنائية)`:`Opening Balance (JD)\n\n⚠️ Agreed amount: ${FLOAT} JD\n(Change only in exceptional cases)`,String(FLOAT));
+  if(ob===null)return;
+  const v=parseFloat(ob);
+  if(isNaN(v)||v<0){sT("✗ "+(rtl?"قيمة غير صالحة":"Invalid value"),"err");return}
+  opening=v;
+}else{
+  // الكاشير: تأكيد بسيط أن الـ 100 موجودة في الدرج
+  if(!confirm(rtl?`هل تأكدت أن الدرج يحتوي على ${FLOAT} JD (نقطة الصفر)؟\n\nاضغط OK للتأكيد وفتح الوردية.`:`Did you verify the drawer contains ${FLOAT} JD (zero point)?\n\nPress OK to confirm and open shift.`))return;
+}
+const s={user_id:cu?.id,cashier_name:cu?.fn,shift_date:new Date().toISOString().slice(0,10),shift_start:new Date().toISOString(),opening_balance:opening,status:"open"};
+try{const r=await DB.openShift(s);if(r){setActiveShift(r);setCashShifts(p=>[r,...p.filter(x=>x.id!==r.id)]);setTab("sale");if(r._wasExisting){sT("ℹ️ "+(rtl?`تم استرجاع وردية مفتوحة سابقاً (افتتاحي ${(+r.opening_balance).toFixed(0)} JD)`:`Resumed existing shift (opening ${(+r.opening_balance).toFixed(0)} JD)`),"ok")}else{try{await DB.clockIn(cu?.id);sT("✓ "+(rtl?`بدأت الوردية برصيد ${opening.toFixed(0)} JD`:`Shift opened with ${opening.toFixed(0)} JD`),"ok")}catch{sT("✓ "+(rtl?"بدأت الوردية":"Shift opened"),"ok")}}}}catch(e){console.error(e);sT("✗ "+(rtl?"فشل فتح الوردية":"Failed to open shift"),"err")}
+}}>🟢 {rtl?"فتح وردية":"Open Shift"}</button>
 </div>
 
 :/* Active shift — show close option */
@@ -7325,7 +7878,7 @@ return<table className="at"><thead><tr>
 <button style={{padding:"14px 20px",background:"#dc2626",border:"none",borderRadius:10,color:"#fff",fontSize:13,fontWeight:800,cursor:"pointer",fontFamily:"var(--f)"}} onClick={async()=>{
 if(!shiftCashCount)return;
 const actualCash=parseFloat(shiftCashCount)||0;
-const todayTx=txns.filter(tx=>{try{const ts=new Date(tx.ts);const ss=new Date(activeShift.shift_start);return ts>=ss&&tx.voidStatus!=="voided"}catch{return false}});
+const todayTx=txns.filter(tx=>{if(tx.voidStatus==="voided")return false;if(tx.shiftId)return tx.shiftId===activeShift.id;try{return new Date(tx.ts)>=new Date(activeShift.shift_start)}catch{return false}});
 const cashSales=todayTx.filter(tx=>tx.method==="cash").reduce((s,tx)=>s+tx.tot,0);
 const cardSales=todayTx.filter(tx=>tx.method==="card").reduce((s,tx)=>s+tx.tot,0);
 const madaSales=todayTx.filter(tx=>tx.method==="mobile").reduce((s,tx)=>s+tx.tot,0);
@@ -7337,7 +7890,7 @@ try{await DB.closeShift(activeShift.id,u);try{await DB.clockOut(cu?.id)}catch{}s
 </div>
 
 {/* Live preview */}
-{shiftCashCount&&(()=>{const actual=parseFloat(shiftCashCount)||0;const todayTx=txns.filter(tx=>{try{return new Date(tx.ts)>=new Date(activeShift.shift_start)&&tx.voidStatus!=="voided"}catch{return false}});const cashS=todayTx.filter(tx=>tx.method==="cash").reduce((s,tx)=>s+tx.tot,0);const cashRet=salesReturns.filter(r=>{try{if(new Date(r.created_at)<new Date(activeShift.shift_start))return false;const origTx=txns.find(tx=>tx.rn===r.receipt_no);return origTx&&origTx.method==="cash"}catch{return false}}).reduce((s,r)=>s+ +r.total_refund,0);const expected=+activeShift.opening_balance+cashS-cashRet;const diff=actual-expected;
+{shiftCashCount&&(()=>{const actual=parseFloat(shiftCashCount)||0;const todayTx=txns.filter(tx=>{if(tx.voidStatus==="voided")return false;if(tx.shiftId)return tx.shiftId===activeShift.id;try{return new Date(tx.ts)>=new Date(activeShift.shift_start)}catch{return false}});const cashS=todayTx.filter(tx=>tx.method==="cash").reduce((s,tx)=>s+tx.tot,0);const cashRet=salesReturns.filter(r=>{try{if(new Date(r.created_at)<new Date(activeShift.shift_start))return false;const origTx=txns.find(tx=>tx.rn===r.receipt_no);return origTx&&origTx.method==="cash"}catch{return false}}).reduce((s,r)=>s+ +r.total_refund,0);const expected=+activeShift.opening_balance+cashS-cashRet;const diff=actual-expected;
 return<div style={{marginTop:10,background:"#fff",borderRadius:10,padding:12,fontSize:12}}>
 <div style={{display:"flex",justifyContent:"space-between",padding:"3px 0"}}><span>{rtl?"الافتتاحي":"Opening"}</span><span style={{fontFamily:"var(--m)"}}>{fm(+activeShift.opening_balance)}</span></div>
 <div style={{display:"flex",justifyContent:"space-between",padding:"3px 0"}}><span>💵 {rtl?"مبيعات نقدية":"Cash Sales"}</span><span style={{fontFamily:"var(--m)"}}>{fm(cashS)}</span></div>
@@ -7351,18 +7904,35 @@ return<div style={{marginTop:10,background:"#fff",borderRadius:10,padding:12,fon
 
 {/* Past closures */}
 <div style={{fontSize:14,fontWeight:700,marginBottom:8}}>📊 {rtl?"سجل الإغلاقات":"Closure History"}</div>
-{cashShifts.filter(s=>s.status==="closed").length===0?<div style={{textAlign:"center",padding:30,color:"#9ca3af"}}>{rtl?"لا إغلاقات سابقة":"No previous closures"}</div>:
-<table className="at"><thead><tr><th>{t.expDate}</th><th>👤</th><th>{rtl?"افتتاحي":"Opening"}</th><th>💵 {rtl?"نقدي":"Cash"}</th><th>💳 {rtl?"بطاقة":"Card"}</th><th>{rtl?"متوقع":"Expected"}</th><th>{rtl?"فعلي":"Actual"}</th><th>{rtl?"الفرق":"Diff"}</th></tr></thead>
-<tbody>{cashShifts.filter(s=>s.status==="closed").slice(0,20).map(s=><tr key={s.id}>
-<td style={{fontSize:11,fontFamily:"var(--m)"}}>{s.shift_date}</td>
-<td style={{fontSize:11}}>{s.cashier_name}</td>
-<td className="mn">{fm(+s.opening_balance)}</td>
-<td className="mn" style={{color:"#059669"}}>{fm(+s.total_cash_sales)}</td>
-<td className="mn" style={{color:"#2563eb"}}>{fm((+(s.total_card_sales||0))+(+(s.total_mada_sales||0)))}</td>
-<td className="mn">{fm(+s.expected_cash)}</td>
-<td className="mn">{fm(+s.actual_cash)}</td>
-<td style={{fontFamily:"var(--m)",fontWeight:700,color:s.difference_type==="overage"?"#059669":s.difference_type==="shortage"?"#dc2626":"#374151"}}>{+s.cash_difference>0?"+":""}{fm(+s.cash_difference)} {s.difference_type==="match"?"✓":s.difference_type==="overage"?"↑":"↓"}</td>
-</tr>)}</tbody></table>}
+{(()=>{
+  const closedShifts=cashShifts.filter(s=>s.status==="closed"||s.status==="auto_closed");
+  if(closedShifts.length===0)return <div style={{textAlign:"center",padding:30,color:"#9ca3af"}}>{rtl?"لا إغلاقات سابقة":"No previous closures"}</div>;
+  const autoCount=closedShifts.filter(s=>s.status==="auto_closed").length;
+  return <>
+    {autoCount>0&&<div style={{padding:"8px 12px",background:"#fff7ed",border:"1.5px solid #fdba74",borderRadius:10,marginBottom:10,fontSize:11,color:"#9a3412",display:"flex",alignItems:"center",gap:8}}>
+      <span style={{fontSize:16}}>⚠️</span>
+      <span><strong>{autoCount}</strong> {rtl?`وردية أُغلقت تلقائياً (لم يُحسب النقد فيها) — راجع التفاصيل`:`shifts auto-closed (no cash count) — review details`}</span>
+    </div>}
+    <table className="at"><thead><tr><th>{t.expDate}</th><th>👤</th><th>{rtl?"الحالة":"Status"}</th><th>{rtl?"افتتاحي":"Opening"}</th><th>💵 {rtl?"نقدي":"Cash"}</th><th>💳 {rtl?"بطاقة":"Card"}</th><th>{rtl?"متوقع":"Expected"}</th><th>{rtl?"فعلي":"Actual"}</th><th>{rtl?"الفرق":"Diff"}</th></tr></thead>
+    <tbody>{closedShifts.slice(0,30).map(s=>{
+      const isAuto=s.status==="auto_closed";
+      return <tr key={s.id} style={{background:isAuto?"#fff7ed":"transparent"}}>
+        <td style={{fontSize:11,fontFamily:"var(--m)"}}>{s.shift_date}</td>
+        <td style={{fontSize:11}}>{s.cashier_name}</td>
+        <td>{isAuto
+          ?<span title={rtl?"أُغلقت تلقائياً — لم يحسب الكاشير النقد":"Auto-closed — cashier did not count cash"} style={{padding:"3px 8px",background:"#fed7aa",color:"#9a3412",borderRadius:10,fontSize:9,fontWeight:800}}>⚠️ {rtl?"تلقائي":"AUTO"}</span>
+          :<span style={{padding:"3px 8px",background:"#dcfce7",color:"#15803d",borderRadius:10,fontSize:9,fontWeight:800}}>✓ {rtl?"يدوي":"MANUAL"}</span>}
+        </td>
+        <td className="mn">{fm(+s.opening_balance)}</td>
+        <td className="mn" style={{color:"#059669"}}>{fm(+(s.total_cash_sales||0))}</td>
+        <td className="mn" style={{color:"#2563eb"}}>{fm((+(s.total_card_sales||0))+(+(s.total_mada_sales||0)))}</td>
+        <td className="mn">{fm(+(s.expected_cash||0))}</td>
+        <td className="mn" style={{color:isAuto?"#9ca3af":"inherit",fontStyle:isAuto?"italic":"normal"}}>{isAuto?(rtl?"—":"—"):fm(+(s.actual_cash||0))}</td>
+        <td style={{fontFamily:"var(--m)",fontWeight:700,color:isAuto?"#9ca3af":(s.difference_type==="overage"?"#059669":s.difference_type==="shortage"?"#dc2626":"#374151")}}>{isAuto?"—":<>{+s.cash_difference>0?"+":""}{fm(+(s.cash_difference||0))} {s.difference_type==="match"?"✓":s.difference_type==="overage"?"↑":"↓"}</>}</td>
+      </tr>;
+    })}</tbody></table>
+  </>;
+})()}
 </div>}
 
 
@@ -7386,7 +7956,7 @@ return<div style={{marginTop:10,background:"#fff",borderRadius:10,padding:12,fon
 <div style={{fontSize:11,color:"#6b7280"}}>{tx.date} {tx.time} · {(tx.items||[]).length} {t.items}{retStatus.status!=="none"&&<span style={{marginLeft:6,color:retStatus.status==="full"?"#dc2626":"#d97706",fontWeight:600}}>· {rtl?"استرداد":"Refunded"}: {fm(retStatus.refundAmount)}</span>}</div>
 </div>
 <div style={{fontFamily:"var(--m)",fontWeight:700,color:retStatus.status==="full"?"#dc2626":"#059669",fontSize:14,textDecoration:retStatus.status==="full"?"line-through":"none"}}>{fm(tx.tot)}</div>
-<button onClick={async(e)=>{e.stopPropagation();if(retStatus.status==="full"){sT("⚠ "+(rtl?"الفاتورة مُرجعة كلياً":"Fully returned"),"err");return}let txWithItems=tx;if(!tx.items||tx.items.length===0){try{const{data:items}=await sb.from("transaction_items").select("*").eq("transaction_id",tx.id).limit(5000);if(items&&items.length>0){txWithItems={...tx,items:items.map(i=>({id:i.product_id||"misc_"+i.id,n:i.product_name||"—",a:i.product_name_ar||i.product_name||"—",bc:i.barcode||"MISC",p:+i.unit_price,qty:i.quantity,_isMisc:!i.product_id}))};setTxns(prev=>prev.map(x=>x.id===tx.id?txWithItems:x))}else{sT("✗ "+(rtl?"لا توجد بنود لهذه الفاتورة":"No items for this transaction"),"err");return}}catch(er){sT("✗ "+er.message,"err");return}}setReturnTxn(txWithItems);setReturnItems(txWithItems.items.map(i=>({...i,returnQty:0,reason:""})));setSalesReturnMod(true)}} style={{padding:"8px 14px",background:retStatus.status==="full"?"#9ca3af":"#dc2626",border:"none",borderRadius:8,color:"#fff",fontSize:11,fontWeight:800,cursor:retStatus.status==="full"?"not-allowed":"pointer",fontFamily:"var(--f)",whiteSpace:"nowrap",opacity:retStatus.status==="full"?0.5:1}} disabled={retStatus.status==="full"}>↩️ {rtl?"إرجاع":"Return"}</button>{cu.role==="admin"&&tx.voidStatus!=="voided"&&<button onClick={(e)=>{e.stopPropagation();setVoidMod(tx);setVoidReason("")}} style={{padding:"8px 12px",background:"#7c2d12",border:"none",borderRadius:8,color:"#fff",fontSize:11,fontWeight:800,cursor:"pointer",fontFamily:"var(--f)",whiteSpace:"nowrap",marginLeft:4}}>🚫 {rtl?"إلغاء":"Void"}</button>}{tx.voidStatus==="voided"&&<span style={{padding:"6px 12px",background:"#fef2f2",color:"#dc2626",border:"1px solid #fca5a5",borderRadius:8,fontSize:10,fontWeight:700,marginLeft:4}}>🚫 {rtl?"ملغاة":"VOIDED"}</span>}
+<button onClick={async(e)=>{e.stopPropagation();if(retStatus.status==="full"){sT("⚠ "+(rtl?"الفاتورة مُرجعة كلياً":"Fully returned"),"err");return}let txWithItems=tx;if(!tx.items||tx.items.length===0){try{const{data:items}=await sb.from("transaction_items").select("*").eq("transaction_id",tx.id).limit(5000);if(items&&items.length>0){txWithItems={...tx,items:items.map(i=>({id:i.product_id||"misc_"+i.id,n:i.product_name||"—",a:i.product_name_ar||i.product_name||"—",bc:i.barcode||"MISC",p:+i.unit_price,qty:i.quantity,_isMisc:!i.product_id}))};setTxns(prev=>prev.map(x=>x.id===tx.id?txWithItems:x))}else{sT("✗ "+(rtl?"لا توجد بنود لهذه الفاتورة":"No items for this transaction"),"err");return}}catch(er){sT("✗ "+er.message,"err");return}}setReturnTxn(txWithItems);setReturnItems(prepareReturnItems(txWithItems));setSalesReturnMod(true)}} style={{padding:"8px 14px",background:retStatus.status==="full"?"#9ca3af":"#dc2626",border:"none",borderRadius:8,color:"#fff",fontSize:11,fontWeight:800,cursor:retStatus.status==="full"?"not-allowed":"pointer",fontFamily:"var(--f)",whiteSpace:"nowrap",opacity:retStatus.status==="full"?0.5:1}} disabled={retStatus.status==="full"}>↩️ {rtl?"إرجاع":"Return"}</button>{cu.role==="admin"&&tx.voidStatus!=="voided"&&<button onClick={(e)=>{e.stopPropagation();setVoidMod(tx);setVoidReason("")}} style={{padding:"8px 12px",background:"#7c2d12",border:"none",borderRadius:8,color:"#fff",fontSize:11,fontWeight:800,cursor:"pointer",fontFamily:"var(--f)",whiteSpace:"nowrap",marginLeft:4}}>🚫 {rtl?"إلغاء":"Void"}</button>}{tx.voidStatus==="voided"&&<span style={{padding:"6px 12px",background:"#fef2f2",color:"#dc2626",border:"1px solid #fca5a5",borderRadius:8,fontSize:10,fontWeight:700,marginLeft:4}}>🚫 {rtl?"ملغاة":"VOIDED"}</span>}
 </div>})}
 </div>}
 
@@ -9589,7 +10159,7 @@ return <div className="dsh">
                         }catch(er){sT("✗ "+er.message,"err");return}
                       }
                       setReturnTxn(txWithItems);
-                      setReturnItems(txWithItems.items.map(i=>({...i,returnQty:0,reason:""})));
+                      setReturnItems(prepareReturnItems(txWithItems));
                       setSalesReturnMod(true);
                     }}
                     title={rtl?"إرجاع":"Return"}
@@ -9706,7 +10276,7 @@ return <div className="dsh">
                         }catch(er){sT("✗ "+er.message,"err");return}
                       }
                       setReturnTxn(txWithItems);
-                      setReturnItems(txWithItems.items.map(i=>({...i,returnQty:0,reason:""})));
+                      setReturnItems(prepareReturnItems(txWithItems));
                       setSalesReturnMod(true);
                     }}
                     style={{padding:"7px 12px",background:"#dc2626",color:"#fff",border:"none",borderRadius:6,fontSize:11,fontWeight:700,cursor:"pointer"}}>
@@ -9858,6 +10428,376 @@ return <div className="dsh">
 </div>
 </div>;
 })()}
+{/* ═══ PURCHASE SUGGESTIONS TAB - "ما يجب شراؤه" ═══ */}
+{tab==="purchaseSuggestions"&&(()=>{
+  // Calculate sales velocity for each product over last 14 days
+  const now=new Date();
+  const days14=14*86400000;
+  const cutoff=new Date(now-days14);
+  
+  const productSales={}; // productId → total qty sold last 14d
+  txns.filter(t=>{
+    try{return new Date(t.ts)>=cutoff&&t.voidStatus!=="voided"}catch{return false}
+  }).forEach(t=>{
+    (t.items||[]).forEach(i=>{
+      if(!i.id||(typeof i.id==="string"&&i.id.startsWith("misc_")))return;
+      const realId=typeof i.id==="string"&&i.id.includes("_w")?i.id.split("_w")[0]:i.id;
+      productSales[realId]=(productSales[realId]||0)+(i.qty||0);
+    });
+  });
+  
+  // Build suggestions
+  const suggestions=prods.filter(p=>{
+    const sold14d=productSales[p.id]||0;
+    if(sold14d===0)return false; // No sales = no suggestion
+    return true;
+  }).map(p=>{
+    const sold14d=productSales[p.id]||0;
+    const dailyAvg=sold14d/14;
+    const stock=p.s||0;
+    const daysCoverage=dailyAvg>0?Math.floor(stock/dailyAvg):999;
+    const safetyDays=14; // 2 weeks safety stock
+    const targetStock=Math.ceil(dailyAvg*safetyDays);
+    const toBuy=Math.max(0,targetStock-stock);
+    
+    let urgency="ok";
+    if(daysCoverage<=3)urgency="urgent";
+    else if(daysCoverage<=7)urgency="warning";
+    else if(daysCoverage<=14)urgency="watch";
+    
+    return {
+      id:p.id,
+      name:pN(p),
+      bc:p.bc,
+      cat:p.cat,
+      supplier:p.supplier||"",
+      stock,
+      sold14d,
+      dailyAvg:dailyAvg.toFixed(1),
+      daysCoverage,
+      toBuy,
+      urgency,
+      cost:p.c||0,
+      estimatedCost:toBuy*(p.c||0)
+    };
+  }).sort((a,b)=>{
+    const order={urgent:0,warning:1,watch:2,ok:3};
+    if(order[a.urgency]!==order[b.urgency])return order[a.urgency]-order[b.urgency];
+    return a.daysCoverage-b.daysCoverage;
+  });
+  
+  const urgentCount=suggestions.filter(s=>s.urgency==="urgent").length;
+  const warningCount=suggestions.filter(s=>s.urgency==="warning").length;
+  const totalEstimatedCost=suggestions.filter(s=>s.toBuy>0).reduce((sum,s)=>sum+s.estimatedCost,0);
+  
+  // Group by supplier for purchase orders
+  const bySupplier={};
+  suggestions.filter(s=>s.toBuy>0).forEach(s=>{
+    const sup=s.supplier||(rtl?"بدون مورد":"No supplier");
+    if(!bySupplier[sup])bySupplier[sup]={items:[],total:0};
+    bySupplier[sup].items.push(s);
+    bySupplier[sup].total+=s.estimatedCost;
+  });
+  
+  return <div style={{flex:1,overflowY:"auto",padding:16,background:"#f9fafb"}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+      <div>
+        <h2 style={{fontSize:20,fontWeight:800,margin:0}}>🛒 {rtl?"ما يجب شراؤه":"What to Buy"}</h2>
+        <div style={{fontSize:11,color:"#6b7280",marginTop:4}}>{rtl?"اقتراحات بناءً على متوسط البيع آخر 14 يوم":"Suggestions based on last 14 days avg sales"}</div>
+      </div>
+    </div>
+    
+    {/* Summary cards */}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(180px, 1fr))",gap:12,marginBottom:20}}>
+      <div style={{background:"#fef2f2",border:"2px solid #fca5a5",padding:14,borderRadius:12}}>
+        <div style={{fontSize:11,color:"#7f1d1d"}}>🚨 {rtl?"عاجل (≤3 أيام)":"Urgent (≤3 days)"}</div>
+        <div style={{fontSize:32,fontWeight:800,color:"#dc2626",fontFamily:"var(--m)"}}>{urgentCount}</div>
+      </div>
+      <div style={{background:"#fffbeb",border:"2px solid #fcd34d",padding:14,borderRadius:12}}>
+        <div style={{fontSize:11,color:"#92400e"}}>⚠️ {rtl?"تحذير (≤7 أيام)":"Warning (≤7 days)"}</div>
+        <div style={{fontSize:32,fontWeight:800,color:"#d97706",fontFamily:"var(--m)"}}>{warningCount}</div>
+      </div>
+      <div style={{background:"#eff6ff",border:"2px solid #93c5fd",padding:14,borderRadius:12}}>
+        <div style={{fontSize:11,color:"#1e40af"}}>💰 {rtl?"تكلفة الشراء المقدرة":"Estimated Cost"}</div>
+        <div style={{fontSize:24,fontWeight:800,color:"#2563eb",fontFamily:"var(--m)"}}>{fm(totalEstimatedCost)}</div>
+      </div>
+      <div style={{background:"#f5f3ff",border:"2px solid #c4b5fd",padding:14,borderRadius:12}}>
+        <div style={{fontSize:11,color:"#5b21b6"}}>📦 {rtl?"إجمالي المنتجات":"Total Products"}</div>
+        <div style={{fontSize:32,fontWeight:800,color:"#7c3aed",fontFamily:"var(--m)"}}>{suggestions.length}</div>
+      </div>
+    </div>
+    
+    {suggestions.length===0?<div style={{textAlign:"center",padding:40,background:"#fff",borderRadius:14,color:"#9ca3af"}}>
+      {rtl?"لا توجد اقتراحات حالياً — كل المخزون كافٍ":"No suggestions — all stock sufficient"}
+    </div>:<>
+    
+    {/* Detailed list */}
+    <div style={{background:"#fff",borderRadius:14,padding:16,marginBottom:20,border:"1px solid #e5e7eb"}}>
+      <div style={{fontSize:14,fontWeight:800,marginBottom:12}}>📋 {rtl?"قائمة المنتجات (مرتبة حسب الإلحاح)":"Products List (by urgency)"}</div>
+      <div style={{overflowX:"auto"}}>
+        <table style={{width:"100%",fontSize:12,borderCollapse:"collapse"}}>
+          <thead>
+            <tr style={{background:"#f3f4f6",fontSize:11}}>
+              <th style={{padding:"8px 6px",textAlign:rtl?"right":"left"}}>{rtl?"الحالة":"Status"}</th>
+              <th style={{padding:"8px 6px",textAlign:rtl?"right":"left"}}>{rtl?"المنتج":"Product"}</th>
+              <th style={{padding:"8px 6px",textAlign:"center"}}>{rtl?"المخزون":"Stock"}</th>
+              <th style={{padding:"8px 6px",textAlign:"center"}}>{rtl?"بيع/يوم":"Sales/day"}</th>
+              <th style={{padding:"8px 6px",textAlign:"center"}}>{rtl?"تغطية":"Coverage"}</th>
+              <th style={{padding:"8px 6px",textAlign:"center"}}>{rtl?"اشترِ":"Buy"}</th>
+              <th style={{padding:"8px 6px",textAlign:"center"}}>{rtl?"تكلفة":"Cost"}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {suggestions.slice(0,100).map(s=>{
+              const colors={
+                urgent:{bg:"#fef2f2",badge:"#dc2626",label:rtl?"عاجل":"URGENT"},
+                warning:{bg:"#fffbeb",badge:"#d97706",label:rtl?"تحذير":"WARN"},
+                watch:{bg:"#fef3c7",badge:"#a16207",label:rtl?"متابعة":"WATCH"},
+                ok:{bg:"#fff",badge:"#059669",label:rtl?"عادي":"OK"}
+              };
+              const c=colors[s.urgency];
+              return <tr key={s.id} style={{background:c.bg,borderBottom:"1px solid #f3f4f6"}}>
+                <td style={{padding:"6px"}}><span style={{padding:"3px 8px",background:c.badge,color:"#fff",borderRadius:8,fontSize:9,fontWeight:800}}>{c.label}</span></td>
+                <td style={{padding:"6px",fontSize:11}}>
+                  <div style={{fontWeight:600}}>{s.name}</div>
+                  {s.supplier&&<div style={{fontSize:9,color:"#6b7280"}}>📍 {s.supplier}</div>}
+                </td>
+                <td style={{padding:"6px",textAlign:"center",fontFamily:"var(--m)",fontWeight:700,color:s.stock<=5?"#dc2626":"#374151"}}>{s.stock}</td>
+                <td style={{padding:"6px",textAlign:"center",fontFamily:"var(--m)",color:"#6b7280"}}>{s.dailyAvg}</td>
+                <td style={{padding:"6px",textAlign:"center",fontFamily:"var(--m)",fontWeight:700,color:c.badge}}>{s.daysCoverage} {rtl?"يوم":"d"}</td>
+                <td style={{padding:"6px",textAlign:"center",fontFamily:"var(--m)",fontWeight:800,color:"#059669"}}>{s.toBuy}</td>
+                <td style={{padding:"6px",textAlign:"center",fontFamily:"var(--m)",color:"#6b7280"}}>{fm(s.estimatedCost)}</td>
+              </tr>;
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    
+    {/* By Supplier - Purchase Order Suggestions */}
+    <div style={{background:"#fff",borderRadius:14,padding:16,border:"1px solid #e5e7eb"}}>
+      <div style={{fontSize:14,fontWeight:800,marginBottom:12}}>🏭 {rtl?"أوامر شراء مقترحة (حسب المورد)":"Suggested Purchase Orders (by Supplier)"}</div>
+      {Object.keys(bySupplier).length===0?<div style={{textAlign:"center",padding:20,color:"#9ca3af",fontSize:12}}>{rtl?"لا توجد اقتراحات":"No suggestions"}</div>:
+      Object.entries(bySupplier).sort((a,b)=>b[1].total-a[1].total).map(([sup,data])=>
+        <div key={sup} style={{background:"#f9fafb",borderRadius:10,padding:12,marginBottom:10,border:"1px solid #e5e7eb"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+            <div style={{fontSize:13,fontWeight:800,color:"#1e40af"}}>📍 {sup}</div>
+            <div style={{fontSize:14,fontFamily:"var(--m)",fontWeight:800,color:"#059669"}}>{fm(data.total)}</div>
+          </div>
+          <div style={{fontSize:11,color:"#6b7280",marginBottom:6}}>{data.items.length} {rtl?"منتج":"products"}</div>
+          {data.items.slice(0,5).map(it=><div key={it.id} style={{display:"flex",justifyContent:"space-between",fontSize:11,padding:"3px 0"}}>
+            <span>{it.name}</span>
+            <span style={{fontFamily:"var(--m)",color:"#7c3aed"}}>×{it.toBuy}</span>
+          </div>)}
+          {data.items.length>5&&<div style={{fontSize:10,color:"#9ca3af",textAlign:"center",marginTop:4}}>+ {data.items.length-5} {rtl?"منتج آخر":"more"}</div>}
+        </div>
+      )}
+    </div>
+    </>}
+  </div>;
+})()}
+
+{/* ═══ SYSTEM HEALTH TAB (Admin only) ═══ */}
+{tab==="systemHealth"&&(()=>{
+  // Compute health metrics from in-memory state
+  const totalTxs=txns.length;
+  const activeTxs=txns.filter(t=>t.voidStatus!=="voided").length;
+  const voidedTxs=txns.filter(t=>t.voidStatus==="voided").length;
+  const orphanTxs=txns.filter(t=>!t.shiftId).length;
+  
+  const openShifts=cashShifts.filter(s=>s.status==="open");
+  const closedShifts=cashShifts.filter(s=>s.status==="closed").length;
+  const autoClosedShifts=cashShifts.filter(s=>s.status==="auto_closed").length;
+  const abandonedShifts=cashShifts.filter(s=>s.status==="abandoned").length;
+  
+  // Stale shifts: open > 12h
+  const staleShifts=openShifts.filter(s=>{
+    try{return new Date()-new Date(s.shift_start)>12*3600000}catch{return false}
+  });
+  
+  // Drift detection (in-memory approximation)
+  const productsWithBatches=prods.filter(p=>{
+    const pBatches=batches.filter(b=>b.product_id===p.id&&b.status==="active");
+    if(pBatches.length===0)return false;
+    const batchSum=pBatches.reduce((a,b)=>a+(+b.quantity_remaining||0),0);
+    return Math.abs(p.s-batchSum)>0.01;
+  });
+  
+  // Today's stats
+  const todayStr=new Date().toLocaleDateString("en-CA");
+  const todayTxs=txns.filter(t=>{
+    try{return new Date(t.ts).toLocaleDateString("en-CA")===todayStr&&t.voidStatus!=="voided"}catch{return false}
+  });
+  const todayRev=todayTxs.reduce((s,t)=>s+t.tot,0);
+  const todayItems=todayTxs.reduce((s,t)=>s+(t.items||[]).reduce((a,i)=>a+i.qty,0),0);
+  
+  // Expiry alerts (products + active batches with expiry)
+  const today_h=new Date();today_h.setHours(0,0,0,0);
+  const expiryAlerts={expired:0,d7:0,d30:0,expiredValue:0,d7Value:0};
+  prods.filter(p=>p.exp&&p.s>0).forEach(p=>{
+    try{
+      const exp=new Date(p.exp);exp.setHours(0,0,0,0);
+      const days=Math.ceil((exp-today_h)/86400000);
+      if(days<0){expiryAlerts.expired++;expiryAlerts.expiredValue+=p.s*(p.c||0)}
+      else if(days<=7){expiryAlerts.d7++;expiryAlerts.d7Value+=p.s*(p.c||0)}
+      else if(days<=30)expiryAlerts.d30++;
+    }catch{}
+  });
+  
+  // Critical issues count
+  const criticalIssues=[];
+  if(orphanTxs>0)criticalIssues.push({sev:"high",msg:rtl?`${orphanTxs} فاتورة بدون وردية`:`${orphanTxs} transactions without shift`});
+  if(staleShifts.length>0)criticalIssues.push({sev:"high",msg:rtl?`${staleShifts.length} ورديات مفتوحة > 12 ساعة`:`${staleShifts.length} shifts open > 12h`});
+  if(productsWithBatches.length>0)criticalIssues.push({sev:"med",msg:rtl?`${productsWithBatches.length} منتج بفروقات stock vs batches`:`${productsWithBatches.length} products with stock drift`});
+  if(expiryAlerts.expired>0)criticalIssues.push({sev:"high",msg:rtl?`${expiryAlerts.expired} منتج منتهي الصلاحية (قيمة ${fm(expiryAlerts.expiredValue)})`:`${expiryAlerts.expired} expired products (value ${fm(expiryAlerts.expiredValue)})`});
+  if(expiryAlerts.d7>0)criticalIssues.push({sev:"med",msg:rtl?`${expiryAlerts.d7} منتج ينتهي خلال 7 أيام`:`${expiryAlerts.d7} products expire within 7 days`});
+  
+  return <div style={{flex:1,overflowY:"auto",padding:16,background:"#f9fafb"}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+      <h2 style={{fontSize:20,fontWeight:800,margin:0}}>🛡️ {rtl?"صحة النظام":"System Health"}</h2>
+      <button onClick={async()=>{
+        const p=await DB.getProducts();setProds(p);
+        const tx=await DB.getTransactions();setTxns(tx);
+        const sh=await DB.getShifts();setCashShifts(sh);
+        const b=await DB.getAllBatches();setBatches(b);
+        sT("✓ "+(rtl?"تم تحديث الفحص":"Refreshed"),"ok");
+      }} style={{padding:"10px 20px",background:"#3b82f6",color:"#fff",border:"none",borderRadius:10,fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"var(--f)"}}>🔄 {rtl?"تحديث":"Refresh"}</button>
+    </div>
+    
+    {/* Critical Issues */}
+    {criticalIssues.length>0?<div style={{background:"#fef2f2",border:"2px solid #fca5a5",borderRadius:14,padding:16,marginBottom:16}}>
+      <div style={{fontSize:14,fontWeight:800,color:"#991b1b",marginBottom:10}}>🚨 {rtl?"تنبيهات حرجة":"Critical Issues"} ({criticalIssues.length})</div>
+      {criticalIssues.map((iss,i)=><div key={i} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",borderBottom:i<criticalIssues.length-1?"1px solid #fee2e2":"none"}}>
+        <span style={{fontSize:14,color:iss.sev==="high"?"#dc2626":"#d97706"}}>{iss.sev==="high"?"🔴":"🟡"}</span>
+        <span style={{fontSize:13,color:"#7f1d1d"}}>{iss.msg}</span>
+      </div>)}
+    </div>:<div style={{background:"#ecfdf5",border:"2px solid #6ee7b7",borderRadius:14,padding:16,marginBottom:16,textAlign:"center"}}>
+      <div style={{fontSize:32,marginBottom:6}}>✅</div>
+      <div style={{fontSize:14,fontWeight:800,color:"#065f46"}}>{rtl?"النظام بصحة جيدة - لا توجد تنبيهات حرجة":"System healthy - no critical issues"}</div>
+    </div>}
+    
+    {/* Today's Activity */}
+    <div style={{background:"#fff",borderRadius:14,padding:16,marginBottom:16,border:"1px solid #e5e7eb"}}>
+      <div style={{fontSize:14,fontWeight:800,marginBottom:12,color:"#1e40af"}}>📅 {rtl?"نشاط اليوم":"Today's Activity"}</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(140px, 1fr))",gap:12}}>
+        <div style={{background:"#eff6ff",padding:12,borderRadius:10}}>
+          <div style={{fontSize:10,color:"#6b7280"}}>{rtl?"فواتير اليوم":"Today's Sales"}</div>
+          <div style={{fontSize:24,fontWeight:800,color:"#1e40af",fontFamily:"var(--m)"}}>{todayTxs.length}</div>
+        </div>
+        <div style={{background:"#ecfdf5",padding:12,borderRadius:10}}>
+          <div style={{fontSize:10,color:"#6b7280"}}>{rtl?"الإيراد":"Revenue"}</div>
+          <div style={{fontSize:24,fontWeight:800,color:"#059669",fontFamily:"var(--m)"}}>{fm(todayRev)}</div>
+        </div>
+        <div style={{background:"#fffbeb",padding:12,borderRadius:10}}>
+          <div style={{fontSize:10,color:"#6b7280"}}>{rtl?"عناصر مباعة":"Items Sold"}</div>
+          <div style={{fontSize:24,fontWeight:800,color:"#d97706",fontFamily:"var(--m)"}}>{todayItems}</div>
+        </div>
+        <div style={{background:"#f5f3ff",padding:12,borderRadius:10}}>
+          <div style={{fontSize:10,color:"#6b7280"}}>{rtl?"ورديات نشطة":"Active Shifts"}</div>
+          <div style={{fontSize:24,fontWeight:800,color:"#7c3aed",fontFamily:"var(--m)"}}>{openShifts.length}</div>
+        </div>
+      </div>
+    </div>
+    
+    {/* Transactions Health */}
+    <div style={{background:"#fff",borderRadius:14,padding:16,marginBottom:16,border:"1px solid #e5e7eb"}}>
+      <div style={{fontSize:14,fontWeight:800,marginBottom:12,color:"#1e40af"}}>🧾 {rtl?"حالة الفواتير":"Transactions Health"}</div>
+      <table style={{width:"100%",fontSize:12}}>
+        <tbody>
+          <tr><td style={{padding:6,color:"#6b7280"}}>{rtl?"الإجمالي":"Total"}</td><td style={{textAlign:"right",fontFamily:"var(--m)",fontWeight:700}}>{totalTxs}</td></tr>
+          <tr><td style={{padding:6,color:"#059669"}}>✅ {rtl?"نشطة":"Active"}</td><td style={{textAlign:"right",fontFamily:"var(--m)",fontWeight:700,color:"#059669"}}>{activeTxs}</td></tr>
+          <tr><td style={{padding:6,color:"#dc2626"}}>🚫 {rtl?"ملغاة":"Voided"}</td><td style={{textAlign:"right",fontFamily:"var(--m)",fontWeight:700,color:"#dc2626"}}>{voidedTxs}</td></tr>
+          <tr style={{background:orphanTxs>0?"#fef2f2":"#ecfdf5"}}><td style={{padding:6,color:orphanTxs>0?"#dc2626":"#059669"}}>{orphanTxs>0?"🔴":"✅"} {rtl?"بدون وردية":"Orphan (no shift)"}</td><td style={{textAlign:"right",fontFamily:"var(--m)",fontWeight:700,color:orphanTxs>0?"#dc2626":"#059669"}}>{orphanTxs}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    
+    {/* Shifts Health */}
+    <div style={{background:"#fff",borderRadius:14,padding:16,marginBottom:16,border:"1px solid #e5e7eb"}}>
+      <div style={{fontSize:14,fontWeight:800,marginBottom:12,color:"#1e40af"}}>📒 {rtl?"حالة الورديات":"Shifts Health"}</div>
+      <table style={{width:"100%",fontSize:12}}>
+        <tbody>
+          <tr><td style={{padding:6}}>🟢 {rtl?"مفتوحة الآن":"Open Now"}</td><td style={{textAlign:"right",fontFamily:"var(--m)",fontWeight:700,color:"#059669"}}>{openShifts.length}</td></tr>
+          <tr style={{background:staleShifts.length>0?"#fef2f2":"transparent"}}><td style={{padding:6,color:staleShifts.length>0?"#dc2626":"#374151"}}>{staleShifts.length>0?"🔴":"⏱️"} {rtl?"مفتوحة > 12 ساعة":"Open > 12h (stale)"}</td><td style={{textAlign:"right",fontFamily:"var(--m)",fontWeight:700,color:staleShifts.length>0?"#dc2626":"#374151"}}>{staleShifts.length}</td></tr>
+          <tr><td style={{padding:6}}>✅ {rtl?"مغلقة يدوياً":"Manually Closed"}</td><td style={{textAlign:"right",fontFamily:"var(--m)",fontWeight:700}}>{closedShifts}</td></tr>
+          <tr><td style={{padding:6,color:"#9a3412"}}>⚠️ {rtl?"مغلقة تلقائياً":"Auto-Closed"}</td><td style={{textAlign:"right",fontFamily:"var(--m)",fontWeight:700,color:"#9a3412"}}>{autoClosedShifts}</td></tr>
+          <tr><td style={{padding:6,color:"#9ca3af"}}>👻 {rtl?"وهمية (مهملة)":"Abandoned"}</td><td style={{textAlign:"right",fontFamily:"var(--m)",color:"#9ca3af"}}>{abandonedShifts}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    
+    {/* Inventory Health */}
+    <div style={{background:"#fff",borderRadius:14,padding:16,marginBottom:16,border:"1px solid #e5e7eb"}}>
+      <div style={{fontSize:14,fontWeight:800,marginBottom:12,color:"#1e40af"}}>📦 {rtl?"حالة المخزون":"Inventory Health"}</div>
+      <table style={{width:"100%",fontSize:12}}>
+        <tbody>
+          <tr><td style={{padding:6}}>{rtl?"إجمالي المنتجات":"Total Products"}</td><td style={{textAlign:"right",fontFamily:"var(--m)",fontWeight:700}}>{prods.length}</td></tr>
+          <tr><td style={{padding:6,color:"#dc2626"}}>{rtl?"مخزون منخفض":"Low Stock"}</td><td style={{textAlign:"right",fontFamily:"var(--m)",fontWeight:700,color:"#dc2626"}}>{prods.filter(p=>p.s<=5&&p.s>0).length}</td></tr>
+          <tr><td style={{padding:6,color:"#7f1d1d"}}>{rtl?"نفد المخزون":"Out of Stock"}</td><td style={{textAlign:"right",fontFamily:"var(--m)",fontWeight:700,color:"#7f1d1d"}}>{prods.filter(p=>p.s<=0).length}</td></tr>
+          <tr style={{background:productsWithBatches.length>0?"#fffbeb":"#ecfdf5"}}><td style={{padding:6,color:productsWithBatches.length>0?"#d97706":"#059669"}}>{productsWithBatches.length>0?"🟡":"✅"} {rtl?"فروقات stock vs batches":"Drift (stock vs batches)"}</td><td style={{textAlign:"right",fontFamily:"var(--m)",fontWeight:700,color:productsWithBatches.length>0?"#d97706":"#059669"}}>{productsWithBatches.length}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    
+    {/* Expiry Alerts */}
+    <div style={{background:"#fff",borderRadius:14,padding:16,marginBottom:16,border:"1px solid #e5e7eb"}}>
+      <div style={{fontSize:14,fontWeight:800,marginBottom:12,color:"#1e40af"}}>📅 {rtl?"تواريخ الانتهاء":"Expiry Alerts"}</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(140px, 1fr))",gap:10}}>
+        <div onClick={()=>setTab("expiryTracker")} style={{cursor:"pointer",background:expiryAlerts.expired>0?"#fef2f2":"#ecfdf5",padding:12,borderRadius:10,border:"1.5px solid "+(expiryAlerts.expired>0?"#fca5a5":"#86efac")}}>
+          <div style={{fontSize:11,color:expiryAlerts.expired>0?"#7f1d1d":"#065f46"}}>❌ {rtl?"منتهي الصلاحية":"Expired"}</div>
+          <div style={{fontSize:24,fontWeight:800,color:expiryAlerts.expired>0?"#dc2626":"#059669",fontFamily:"var(--m)"}}>{expiryAlerts.expired}</div>
+          {expiryAlerts.expired>0&&<div style={{fontSize:10,color:"#7f1d1d"}}>{rtl?"قيمة":"value"}: {fm(expiryAlerts.expiredValue)}</div>}
+        </div>
+        <div onClick={()=>setTab("expiryTracker")} style={{cursor:"pointer",background:expiryAlerts.d7>0?"#fff7ed":"#ecfdf5",padding:12,borderRadius:10,border:"1.5px solid "+(expiryAlerts.d7>0?"#fdba74":"#86efac")}}>
+          <div style={{fontSize:11,color:"#9a3412"}}>⚠️ {rtl?"خلال 7 أيام":"Within 7 days"}</div>
+          <div style={{fontSize:24,fontWeight:800,color:"#ea580c",fontFamily:"var(--m)"}}>{expiryAlerts.d7}</div>
+          {expiryAlerts.d7>0&&<div style={{fontSize:10,color:"#9a3412"}}>{rtl?"قيمة":"value"}: {fm(expiryAlerts.d7Value)}</div>}
+        </div>
+        <div onClick={()=>setTab("expiryTracker")} style={{cursor:"pointer",background:"#fffbeb",padding:12,borderRadius:10,border:"1.5px solid #fcd34d"}}>
+          <div style={{fontSize:11,color:"#92400e"}}>📆 {rtl?"خلال 30 يوم":"Within 30 days"}</div>
+          <div style={{fontSize:24,fontWeight:800,color:"#d97706",fontFamily:"var(--m)"}}>{expiryAlerts.d30}</div>
+        </div>
+      </div>
+      <div style={{textAlign:"center",fontSize:10,color:"#9ca3af",marginTop:8}}>{rtl?"اضغط على البطاقة لعرض التفاصيل":"Click card to view details"}</div>
+    </div>
+    
+    {/* Architecture Protections Status */}
+    <div style={{background:"#fff",borderRadius:14,padding:16,marginBottom:16,border:"1px solid #e5e7eb"}}>
+      <div style={{fontSize:14,fontWeight:800,marginBottom:12,color:"#1e40af"}}>🛡️ {rtl?"الحمايات المعمارية":"Architecture Protections"}</div>
+      <div style={{display:"grid",gap:8,fontSize:12}}>
+        <div style={{display:"flex",justifyContent:"space-between",padding:"6px 10px",background:"#ecfdf5",borderRadius:6}}>
+          <span>✅ {rtl?"UNIQUE على رقم الفاتورة":"UNIQUE on invoice_no"}</span>
+          <span style={{color:"#059669",fontWeight:700}}>{rtl?"مفعل":"Active"}</span>
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between",padding:"6px 10px",background:"#ecfdf5",borderRadius:6}}>
+          <span>✅ {rtl?"CHECK على الكميات السالبة":"CHECK negative quantities"}</span>
+          <span style={{color:"#059669",fontWeight:700}}>{rtl?"مفعل":"Active"}</span>
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between",padding:"6px 10px",background:"#ecfdf5",borderRadius:6}}>
+          <span>✅ {rtl?"Trigger مزامنة الفاتورة":"Invoice total sync trigger"}</span>
+          <span style={{color:"#059669",fontWeight:700}}>{rtl?"مفعل":"Active"}</span>
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between",padding:"6px 10px",background:"#ecfdf5",borderRadius:6}}>
+          <span>✅ {rtl?"Trigger ربط الباتشات":"Batch auto-link trigger"}</span>
+          <span style={{color:"#059669",fontWeight:700}}>{rtl?"مفعل":"Active"}</span>
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between",padding:"6px 10px",background:"#ecfdf5",borderRadius:6}}>
+          <span>✅ {rtl?"Trigger مزامنة المخزون":"Stock-batches sync trigger"}</span>
+          <span style={{color:"#059669",fontWeight:700}}>{rtl?"مفعل":"Active"}</span>
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between",padding:"6px 10px",background:"#ecfdf5",borderRadius:6}}>
+          <span>✅ {rtl?"Atomic rollback عند الفشل":"Atomic rollback on failure"}</span>
+          <span style={{color:"#059669",fontWeight:700}}>{rtl?"مفعل":"Active"}</span>
+        </div>
+      </div>
+    </div>
+    
+    <div style={{textAlign:"center",fontSize:11,color:"#9ca3af",marginTop:20,padding:12}}>
+      {rtl?"آخر تحديث":"Last refresh"}: {new Date().toLocaleString(rtl?"ar":"en-US")}
+    </div>
+  </div>;
+})()}
+
 {tab==="dashboard"&&<div className="dsh">
 {/* Header with live indicator */}
 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
@@ -10587,7 +11527,7 @@ return <div className="dsh">
         const avgTxn=empTxs.length>0?totalRev/empTxs.length:0;
         const shifts=cashShifts.filter(s=>s.cashier_name===u.full_name||(u.name_ar&&s.cashier_name===u.name_ar));
         const activeShift2=shifts.find(s=>s.status==="open");
-        const closedShifts=shifts.filter(s=>s.status==="closed");
+        const closedShifts=shifts.filter(s=>s.status==="closed"||s.status==="auto_closed");
         const totalShortage=closedShifts.reduce((s,sh)=>s+(sh.difference_type==="shortage"?Math.abs(+sh.cash_difference||0):0),0);
         const totalOverage=closedShifts.reduce((s,sh)=>s+(sh.difference_type==="overage"?(+sh.cash_difference||0):0),0);
         // Payment breakdown
@@ -15076,11 +16016,268 @@ beep();
 </div></div>}
 
 {/* PAYMENT MODAL */}
-{pmMod&&<div className="ov" onClick={()=>setPM(null)}><div className="md" onClick={e=>e.stopPropagation()}><h2>{pmMod==="cash"?"💵":pmMod==="card"?"💳":pmMod==="credit"?"📝":pmMod==="ashyai"?"🛵":pmMod==="talabat"?"🍔":"📱"} {pmMod==="cash"?t.cashPay:pmMod==="card"?t.cardPay:pmMod==="credit"?(rtl?"بيع آجل":"Credit Sale"):pmMod==="ashyai"?(rtl?"دفع أشيائي":"Ashya2i Payment"):pmMod==="talabat"?(rtl?"دفع طلبات":"Talabat Payment"):t.madaPay}<button className="mc" onClick={()=>setPM(null)}>✕</button></h2>
-{selCust&&<div style={{background:"var(--blue50)",borderRadius:12,padding:10,marginBottom:12,display:"flex",justifyContent:"space-between",alignItems:"center"}}><div style={{display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:20}}>👤</span><div><div style={{fontSize:13,fontWeight:700,color:"#1e40af"}}>{selCust.name}</div><div style={{fontSize:10,color:"#6b7280"}}>{selCust.phone} · {t[selCust.tier]}</div></div></div><div style={{textAlign:"right"}}><div style={{fontSize:10,color:"#059669",fontWeight:600}}>+{earnablePts} {t.points}</div>{redeemPts>0&&<div style={{fontSize:10,color:"#7c3aed",fontWeight:600}}>-{redeemPts} {t.points} ({fm(redeemVal)})</div>}</div></div>}
-<div className="ptd">{fm(selCust&&redeemPts>0?totAfterRedeem:tot)}</div>
-{redeemPts>0&&selCust&&<div style={{textAlign:"center",fontSize:11,color:"#7c3aed",marginTop:-10,marginBottom:10}}>🎁 {t.redeemPts}: -{fm(redeemVal)}</div>}
-{pmMod==="cash"&&<><div className="pf"><label>{t.tendered} <span style={{fontSize:9,color:"#9ca3af",fontWeight:400}}>({rtl?"اختياري":"optional"})</span></label><input type="number" step="0.001" min="0" inputMode="decimal" value={cTend} onChange={e=>setCT(e.target.value)} autoFocus placeholder={rtl?"اتركه فارغاً إذا المبلغ مساوٍ للإجمالي":"Leave empty if exact amount"}/><div style={{fontSize:10,color:"#6b7280",marginTop:4,fontStyle:"italic"}}>💡 {rtl?"إذا تُرك فارغاً، سيُعتبر المبلغ المستلم مساوياً للإجمالي (بدون فكّة)":"If empty, amount received = total (no change)"}</div></div>{parseFloat(cTend)>=(selCust&&redeemPts>0?totAfterRedeem:tot)&&<div className="chd"><div className="chl">{t.change}</div><div className="cha">{fm(parseFloat(cTend)-(selCust&&redeemPts>0?totAfterRedeem:tot))}</div></div>}</>}{pmMod==="card"&&<div style={{textAlign:"center",padding:24,color:"#6b7280"}}><div style={{fontSize:48,marginBottom:12}}>💳</div>{t.insertCard}</div>}{pmMod==="mobile"&&<div style={{textAlign:"center",padding:24,color:"#6b7280"}}><div style={{fontSize:48,marginBottom:12}}>📱</div>{t.scanMada}</div>}{pmMod==="credit"&&<div style={{textAlign:"center",padding:24,color:"#7c3aed"}}><div style={{fontSize:48,marginBottom:12}}>📝</div><div style={{fontSize:14,fontWeight:700}}>{rtl?"بيع آجل — على حساب العميل":"Credit Sale — on customer account"}</div><div style={{fontSize:12,color:"#6b7280",marginTop:8}}>👤 {selCust?.name} · {selCust?.phone}</div></div>}{pmMod==="ashyai"&&<div style={{textAlign:"center",padding:24,color:"#ea580c"}}><div style={{fontSize:48,marginBottom:12}}>🛵</div><div style={{fontSize:14,fontWeight:700}}>{rtl?"طلب عبر أشيائي":"Ashya2i Order"}</div><div style={{fontSize:12,color:"#6b7280",marginTop:8}}>{rtl?"سيتم تسجيل الفاتورة كطلب توصيل أشيائي":"Will be recorded as Ashya2i delivery order"}</div></div>}{pmMod==="talabat"&&<div style={{textAlign:"center",padding:24,color:"#f97316"}}><div style={{fontSize:48,marginBottom:12}}>🍔</div><div style={{fontSize:14,fontWeight:700}}>{rtl?"طلب عبر طلبات":"Talabat Order"}</div><div style={{fontSize:12,color:"#6b7280",marginTop:8}}>{rtl?"سيتم تسجيل الفاتورة كطلب توصيل طلبات":"Will be recorded as Talabat delivery order"}</div></div>}<button className="cpb cpb-green" onClick={cP} disabled={!canC||processing} style={{opacity:processing?0.5:1,cursor:processing?"wait":"pointer"}}>{processing?(rtl?"⏳ جاري الحفظ...":"⏳ Processing..."):"✓ "+t.confirm+" — "+fm(selCust&&redeemPts>0?totAfterRedeem:tot)}</button></div></div>}
+{/* ═══ Ctrl+K Command Palette ═══ */}
+{cmdkOpen&&(()=>{
+  const isMgr=cu?.role==="admin"||cu?.role==="manager";
+  const isAdmin=cu?.role==="admin";
+  // Build flat list of all navigable destinations
+  const all=[];
+  const cfgItems=[
+    {l:rtl?"الرئيسية":"Home",i:"🏠",id:"home",cat:rtl?"رئيسي":"Main"},
+    {l:rtl?"نقطة البيع":"POS",i:"🛒",id:"sale",cat:rtl?"رئيسي":"Main"},
+    {l:rtl?"الطلبات":"Orders",i:"📋",id:"orders",cat:rtl?"المبيعات":"Sales"},
+    {l:rtl?"المرتجعات":"Returns",i:"↩️",id:"posReturn",cat:rtl?"المبيعات":"Sales"},
+    {l:rtl?"سجل المبيعات":"Sales History",i:"📋",id:"sales",cat:rtl?"المبيعات":"Sales",show:hasP("sales_view")},
+    {l:rtl?"إدارة النقد":"Cash Management",i:"💰",id:"cashMgmt",cat:rtl?"الصندوق":"Cash"},
+    {l:rtl?"فتح/إغلاق الصندوق":"Open/Close Register",i:"🔒",id:"regClose",cat:rtl?"الصندوق":"Cash"},
+    {l:rtl?"سجل الورديات":"Shift Ledger",i:"📒",id:"shiftLedger",cat:rtl?"الصندوق":"Cash"},
+    {l:rtl?"مطابقة الصندوق":"Reconciliation",i:"🧮",atab:"reconcile",cat:rtl?"الصندوق":"Cash",show:isMgr},
+    {l:rtl?"كميات المنتجات":"Product Quantities",i:"📦",id:"stockCheck",cat:rtl?"المخزون":"Inventory"},
+    {l:rtl?"متابعة الصلاحية":"Expiry Tracker",i:"📅",id:"expiryTracker",cat:rtl?"المخزون":"Inventory"},
+    {l:rtl?"بحث مبيعات منتج":"Product Sales Lookup",i:"🔍",id:"prodSalesLookup",cat:rtl?"المخزون":"Inventory"},
+    {l:rtl?"إدارة المنتجات":"Manage Products",i:"✏️",atab:"inventory",cat:rtl?"المخزون":"Inventory",show:hasP("inventory")},
+    {l:rtl?"جرد البضاعة":"Stocktake",i:"📋",atab:"stocktake",cat:rtl?"المخزون":"Inventory",show:hasP("inventory")},
+    {l:rtl?"تتبع المنتج":"Product Tracker",i:"🔎",atab:"prodTracker",cat:rtl?"المخزون":"Inventory",show:hasP("inventory")},
+    {l:rtl?"مراجعة الأسعار":"Price Review",i:"💰",atab:"pricereview",cat:rtl?"المخزون":"Inventory",show:hasP("inventory")},
+    {l:rtl?"إدارة الفئات":"Categories",i:"🏷️",atab:"categories",cat:rtl?"المخزون":"Inventory",show:isAdmin},
+    {l:rtl?"الحزم والعروض":"Packages & Promos",i:"📦",atab:"packages",cat:rtl?"المخزون":"Inventory",show:isAdmin},
+    {l:rtl?"فواتير الشراء":"Purchase Invoices",i:"🧾",atab:"purchases",cat:rtl?"المشتريات":"Purchasing",show:hasP("purchases")||isMgr},
+    {l:rtl?"الموردون":"Vendors",i:"🏭",atab:"vendors",cat:rtl?"المشتريات":"Purchasing",show:hasP("purchases")||isMgr},
+    {l:rtl?"ربط جماعي للموردين":"Bulk Vendor Assign",i:"📦",atab:"bulkassign",cat:rtl?"المشتريات":"Purchasing",show:isAdmin},
+    {l:rtl?"طلبات أونلاين":"Online Orders",i:"🛵",id:"onlineOrders",cat:rtl?"التوصيل":"Delivery"},
+    {l:rtl?"منتجات أشيائي":"Ashya2i Products",i:"🛵",id:"ashyaiProducts",cat:rtl?"التوصيل":"Delivery"},
+    {l:rtl?"مبيعات الدخان":"Tobacco Sales",i:"🚬",id:"cigInvoices",cat:rtl?"التوصيل":"Delivery"},
+    {l:rtl?"مدير التشغيل":"Ops Manager",i:"📋",id:"opsManager",cat:rtl?"التوصيل":"Delivery"},
+    {l:rtl?"لوحة التحكم":"Dashboard",i:"📊",id:"dashboard",cat:rtl?"التقارير":"Reports",show:hasP("dashboard")},
+    {l:rtl?"التحليلات":"Analytics",i:"🧠",id:"analytics",cat:rtl?"التقارير":"Reports",show:hasP("dashboard")},
+    {l:rtl?"تقرير التبغ":"Tobacco Report",i:"🚬",id:"tobacco",cat:rtl?"التقارير":"Reports",show:hasP("dashboard")&&prods.some(p=>p.cat==="cigarettes")},
+    {l:rtl?"التدقيق الذكي":"Smart Audit",i:"🔍",atab:"audit",cat:rtl?"التقارير":"Reports",show:isAdmin},
+    {l:rtl?"الموارد البشرية":"HR & Payroll",i:"🏢",id:"hr",cat:rtl?"الموظفين":"People",show:hasP("hr")},
+    {l:rtl?"برنامج الولاء":"Loyalty Program",i:"⭐",atab:"loyalty",cat:rtl?"الموظفين":"People",show:hasP("loyalty")},
+    {l:rtl?"إدارة المستخدمين":"User Management",i:"👥",atab:"users",cat:rtl?"الموظفين":"People",show:isAdmin},
+    {l:rtl?"المالية":"Finance",i:"💰",id:"finance",cat:rtl?"المالية":"Finance",show:hasP("finance")},
+    {l:rtl?"إعدادات النظام":"System Settings",i:"⚙️",atab:"settings",cat:rtl?"الإعدادات":"Settings",show:isMgr},
+  ];
+  const visibleAll=cfgItems.filter(it=>it.show!==false);
+  const q=cmdkQuery.trim().toLowerCase();
+  const filtered=q===""?visibleAll:visibleAll.filter(it=>(it.l||"").toLowerCase().includes(q)||(it.cat||"").toLowerCase().includes(q));
+  const goItem=(it)=>{if(it.id)setTab(it.id);else if(it.atab){setTab("admin");setAT(it.atab)};setCmdkOpen(false);setCmdkQuery("")};
+  return <div className="ov" onClick={()=>setCmdkOpen(false)} style={{paddingTop:"10vh"}}>
+    <div onClick={e=>e.stopPropagation()} style={{background:"#fff",borderRadius:14,maxWidth:560,width:"100%",margin:"auto",boxShadow:"0 24px 60px rgba(0,0,0,.4)",overflow:"hidden",border:"2px solid #1e40af",direction:rtl?"rtl":"ltr",maxHeight:"75vh",display:"flex",flexDirection:"column"}}>
+      <div style={{padding:"14px 16px",borderBottom:"1.5px solid #e2e8f0",display:"flex",alignItems:"center",gap:10}}>
+        <span style={{fontSize:22}}>🔍</span>
+        <input ref={cmdkRef} autoFocus value={cmdkQuery} onChange={e=>{setCmdkQuery(e.target.value);setCmdkIdx(0)}} onKeyDown={e=>{
+          if(e.key==="Escape"){setCmdkOpen(false)}
+          else if(e.key==="ArrowDown"){e.preventDefault();setCmdkIdx(i=>Math.min(i+1,filtered.length-1))}
+          else if(e.key==="ArrowUp"){e.preventDefault();setCmdkIdx(i=>Math.max(0,i-1))}
+          else if(e.key==="Enter"&&filtered[cmdkIdx]){e.preventDefault();goItem(filtered[cmdkIdx])}
+        }} placeholder={rtl?"اكتب اسم الشاشة... (مثل: مبيعات، مخزون، عملاء)":"Type screen name... (e.g. sales, inventory, customers)"} style={{flex:1,padding:"10px 14px",border:"none",outline:"none",fontSize:16,fontWeight:600,fontFamily:"var(--f)",background:"transparent"}}/>
+        <span style={{fontSize:10,fontWeight:700,color:"#94a3b8",padding:"4px 8px",background:"#f1f5f9",borderRadius:6}}>ESC</span>
+      </div>
+      <div style={{flex:1,overflowY:"auto",padding:"4px 6px"}}>
+        {filtered.length===0?<div style={{padding:30,textAlign:"center",color:"#94a3b8"}}>
+          <div style={{fontSize:42,opacity:.4,marginBottom:8}}>🔍</div>
+          <div style={{fontSize:14,fontWeight:700}}>{rtl?"لا توجد نتائج لـ":"No results for"} "{cmdkQuery}"</div>
+        </div>:(()=>{
+          // Group by cat
+          const groups={};
+          filtered.forEach((it,idx)=>{const c=it.cat||"";if(!groups[c])groups[c]=[];groups[c].push({...it,_globalIdx:idx})});
+          const out=[];
+          Object.entries(groups).forEach(([catName,items])=>{
+            out.push(<div key={"cat_"+catName} style={{padding:"8px 12px 4px",fontSize:10,fontWeight:800,color:"#64748b",letterSpacing:1,textTransform:"uppercase"}}>{catName}</div>);
+            items.forEach(it=>{
+              const isSel=it._globalIdx===cmdkIdx;
+              out.push(<button key={(it.id||it.atab)+"_"+it._globalIdx} onClick={()=>goItem(it)} onMouseEnter={()=>setCmdkIdx(it._globalIdx)} style={{width:"100%",padding:"10px 12px",border:"none",borderRadius:8,background:isSel?"#eff6ff":"transparent",color:isSel?"#1e40af":"#1e293b",fontSize:14,fontWeight:isSel?800:600,cursor:"pointer",fontFamily:"var(--f)",textAlign:rtl?"right":"left",display:"flex",alignItems:"center",gap:12,marginBottom:2,minHeight:42}}>
+                <span style={{fontSize:18,width:24,textAlign:"center"}}>{it.i}</span>
+                <span style={{flex:1}}>{it.l}</span>
+                {isSel&&<span style={{fontSize:11,fontWeight:700,color:"#94a3b8",padding:"2px 8px",background:"#f1f5f9",borderRadius:6}}>↵</span>}
+              </button>);
+            });
+          });
+          return out;
+        })()}
+      </div>
+      <div style={{padding:"8px 14px",borderTop:"1.5px solid #e2e8f0",background:"#f8fafc",display:"flex",justifyContent:"space-between",alignItems:"center",fontSize:10,color:"#64748b",fontWeight:600}}>
+        <span>{filtered.length} {rtl?"نتيجة":"results"}</span>
+        <span>↑↓ {rtl?"تنقل":"navigate"} · ↵ {rtl?"اختيار":"select"} · ESC {rtl?"إغلاق":"close"}</span>
+      </div>
+    </div>
+  </div>;
+})()}
+
+{pmMod&&<div className="ov" onClick={()=>{if(!processing)setPM(null)}}><div onClick={e=>e.stopPropagation()} style={{background:"linear-gradient(180deg,#0f172a,#1e293b)",borderRadius:20,padding:0,maxWidth:520,width:"100%",margin:"auto",boxShadow:"0 20px 60px rgba(0,0,0,.5)",border:"3px solid "+(pmMod==="cash"?"#10b981":pmMod==="card"?"#3b82f6":pmMod==="mobile"?"#0d9488":pmMod==="credit"?"#7c3aed":pmMod==="ashyai"?"#ea580c":"#f97316"),overflow:"hidden",direction:rtl?"rtl":"ltr"}}>
+
+{/* ─── Header ─── */}
+<div style={{padding:"14px 20px",background:"rgba(255,255,255,.05)",borderBottom:"1.5px solid rgba(255,255,255,.1)",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+<div style={{display:"flex",alignItems:"center",gap:12}}>
+<span style={{fontSize:32}}>{pmMod==="cash"?"💵":pmMod==="card"?"💳":pmMod==="credit"?"📝":pmMod==="ashyai"?"🛵":pmMod==="talabat"?"🍔":"📱"}</span>
+<div>
+<div style={{fontSize:18,fontWeight:900,color:"#fff",lineHeight:1.2}}>{pmMod==="cash"?t.cashPay:pmMod==="card"?t.cardPay:pmMod==="credit"?(rtl?"بيع آجل":"Credit Sale"):pmMod==="ashyai"?(rtl?"دفع أشيائي":"Ashya2i Payment"):pmMod==="talabat"?(rtl?"دفع طلبات":"Talabat Payment"):t.madaPay}</div>
+<div style={{fontSize:11,color:"#94a3b8",fontWeight:600,marginTop:2}}>{rtl?"اضغط Enter للتأكيد · Esc للإلغاء":"Press Enter to confirm · Esc to cancel"}</div>
+</div>
+</div>
+<button onClick={()=>{if(!processing)setPM(null)}} disabled={processing} style={{width:40,height:40,borderRadius:"50%",border:"1.5px solid rgba(255,255,255,.2)",background:"rgba(255,255,255,.08)",color:"#fff",fontSize:18,fontWeight:800,cursor:processing?"not-allowed":"pointer",opacity:processing?.4:1,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+</div>
+
+{/* ─── Customer chip (if any) ─── */}
+{selCust&&<div style={{margin:"14px 20px 0",padding:"10px 14px",background:"rgba(59,130,246,.15)",border:"1.5px solid rgba(59,130,246,.4)",borderRadius:12,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+<div style={{display:"flex",alignItems:"center",gap:10}}>
+<span style={{fontSize:22}}>👤</span>
+<div>
+<div style={{fontSize:14,fontWeight:800,color:"#dbeafe"}}>{selCust.name}</div>
+<div style={{fontSize:11,color:"#93c5fd",fontFamily:"var(--m)"}}>{selCust.phone} · {t[selCust.tier]}</div>
+</div>
+</div>
+<div style={{textAlign:rtl?"left":"right"}}>
+<div style={{fontSize:12,color:"#6ee7b7",fontWeight:800}}>+{earnablePts} {t.points}</div>
+{redeemPts>0&&<div style={{fontSize:11,color:"#c4b5fd",fontWeight:700,marginTop:2}}>-{redeemPts} ({fm(redeemVal)})</div>}
+</div>
+</div>}
+
+{/* ─── BIG TOTAL DISPLAY ─── */}
+<div style={{padding:"22px 20px 18px",textAlign:"center"}}>
+<div style={{fontSize:13,fontWeight:700,color:"#94a3b8",marginBottom:6,letterSpacing:1,textTransform:"uppercase"}}>{rtl?"المبلغ المطلوب":"Amount Due"}</div>
+<div style={{fontSize:56,fontWeight:900,color:"#10b981",fontFamily:"var(--m)",lineHeight:1,textShadow:"0 2px 12px rgba(16,185,129,.4)"}}>{fm(selCust&&redeemPts>0?totAfterRedeem:tot)}</div>
+{redeemPts>0&&selCust&&<div style={{fontSize:11,color:"#c4b5fd",marginTop:8,fontWeight:700}}>🎁 {t.redeemPts}: -{fm(redeemVal)}</div>}
+</div>
+
+{/* ─── CASH payment (full UX) ─── */}
+{pmMod==="cash"&&<div style={{padding:"0 20px 18px"}}>
+{/* Tendered input */}
+<div style={{marginBottom:10}}>
+<label style={{fontSize:13,fontWeight:700,color:"#cbd5e1",display:"block",marginBottom:8}}>{t.tendered} <span style={{fontSize:11,fontWeight:500,color:"#94a3b8"}}>({rtl?"اختياري — اتركه فارغاً للمطابق":"optional — leave empty for exact"})</span></label>
+<input
+  type="number" step="0.001" min="0" inputMode="decimal"
+  value={cTend}
+  onChange={e=>setCT(e.target.value)}
+  onKeyDown={e=>{if(e.key==="Enter"&&canC&&!processing){e.preventDefault();cP()}}}
+  autoFocus
+  placeholder={rtl?"اكتب المبلغ المستلم...":"Enter amount received..."}
+  style={{
+    width:"100%",
+    height:60,
+    padding:"0 18px",
+    background:"#fff",
+    border:"3px solid "+(parseFloat(cTend)>=(selCust&&redeemPts>0?totAfterRedeem:tot)?"#10b981":"#475569"),
+    borderRadius:14,
+    fontSize:26,
+    fontWeight:900,
+    fontFamily:"var(--m)",
+    color:"#0f172a",
+    outline:"none",
+    textAlign:"center",
+    direction:"ltr"
+  }}
+/>
+</div>
+
+{/* Quick-cash buttons */}
+{(()=>{
+  const dueAmt=selCust&&redeemPts>0?totAfterRedeem:tot;
+  const presets=[
+    {l:rtl?"مطابق":"Exact",v:dueAmt.toFixed(3),hl:true},
+    {l:"1 JD",v:"1.000"},
+    {l:"5 JD",v:"5.000"},
+    {l:"10 JD",v:"10.000"},
+    {l:"20 JD",v:"20.000"},
+    {l:"50 JD",v:"50.000"},
+  ].filter(p=>parseFloat(p.v)>=dueAmt-0.001);
+  if(presets.length===0)return null;
+  return <div style={{display:"grid",gridTemplateColumns:`repeat(${Math.min(presets.length,6)},1fr)`,gap:6,marginBottom:10}}>
+    {presets.map((p,i)=><button key={i} onClick={()=>setCT(p.v)} style={{padding:"10px 4px",background:cTend===p.v?"#10b981":(p.hl?"rgba(16,185,129,.15)":"rgba(255,255,255,.08)"),border:"1.5px solid "+(cTend===p.v?"#10b981":(p.hl?"rgba(16,185,129,.5)":"rgba(255,255,255,.15)")),borderRadius:10,color:cTend===p.v?"#fff":(p.hl?"#6ee7b7":"#cbd5e1"),fontSize:13,fontWeight:800,cursor:"pointer",fontFamily:"var(--f)",transition:"all .1s"}}>{p.l}</button>)}
+  </div>;
+})()}
+
+{/* Change due display */}
+{parseFloat(cTend)>=(selCust&&redeemPts>0?totAfterRedeem:tot)&&parseFloat(cTend)>0&&<div style={{padding:"14px 18px",background:"linear-gradient(135deg,rgba(16,185,129,.18),rgba(5,150,105,.15))",border:"2.5px solid #10b981",borderRadius:14,display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+<span style={{fontSize:16,fontWeight:800,color:"#86efac"}}>💰 {t.change}</span>
+<span style={{fontSize:32,fontWeight:900,color:"#10b981",fontFamily:"var(--m)",lineHeight:1}}>{fm(parseFloat(cTend)-(selCust&&redeemPts>0?totAfterRedeem:tot))}</span>
+</div>}
+</div>}
+
+{/* ─── CARD payment ─── */}
+{pmMod==="card"&&<div style={{padding:"0 20px 18px",textAlign:"center"}}>
+<div style={{padding:"24px 20px",background:"rgba(59,130,246,.1)",border:"2px dashed rgba(59,130,246,.4)",borderRadius:14,marginBottom:10}}>
+<div style={{fontSize:60,marginBottom:10}}>💳</div>
+<div style={{fontSize:15,fontWeight:700,color:"#dbeafe"}}>{t.insertCard}</div>
+<div style={{fontSize:12,color:"#93c5fd",marginTop:8,fontWeight:600}}>{rtl?"أدخل المبلغ على جهاز فيزا ثم اضغط تأكيد":"Enter amount on Visa terminal then confirm"}</div>
+</div>
+</div>}
+
+{/* ─── MOBILE payment ─── */}
+{pmMod==="mobile"&&<div style={{padding:"0 20px 18px",textAlign:"center"}}>
+<div style={{padding:"24px 20px",background:"rgba(13,148,136,.1)",border:"2px dashed rgba(13,148,136,.4)",borderRadius:14,marginBottom:10}}>
+<div style={{fontSize:60,marginBottom:10}}>📱</div>
+<div style={{fontSize:15,fontWeight:700,color:"#a7f3d0"}}>{t.scanMada}</div>
+<div style={{fontSize:12,color:"#6ee7b7",marginTop:8,fontWeight:600}}>{rtl?"تأكد من إتمام التحويل قبل التأكيد":"Confirm transfer completed before submitting"}</div>
+</div>
+</div>}
+
+{/* ─── CREDIT (آجل) ─── */}
+{pmMod==="credit"&&<div style={{padding:"0 20px 18px",textAlign:"center"}}>
+<div style={{padding:"22px 20px",background:"rgba(124,58,237,.12)",border:"2px solid rgba(124,58,237,.4)",borderRadius:14,marginBottom:10}}>
+<div style={{fontSize:54,marginBottom:8}}>📝</div>
+<div style={{fontSize:15,fontWeight:800,color:"#ddd6fe"}}>{rtl?"بيع آجل — على حساب العميل":"Credit Sale — on customer account"}</div>
+<div style={{fontSize:12,color:"#c4b5fd",marginTop:10,fontWeight:600}}>👤 {selCust?.name} · {selCust?.phone}</div>
+</div>
+</div>}
+
+{/* ─── ASHYA2I ─── */}
+{pmMod==="ashyai"&&<div style={{padding:"0 20px 18px",textAlign:"center"}}>
+<div style={{padding:"22px 20px",background:"rgba(234,88,12,.12)",border:"2px solid rgba(234,88,12,.4)",borderRadius:14,marginBottom:10}}>
+<div style={{fontSize:54,marginBottom:8}}>🛵</div>
+<div style={{fontSize:15,fontWeight:800,color:"#fed7aa"}}>{rtl?"طلب عبر أشيائي":"Ashya2i Order"}</div>
+<div style={{fontSize:12,color:"#fdba74",marginTop:8,fontWeight:600}}>{rtl?"سيتم تسجيل الفاتورة كطلب توصيل أشيائي":"Will be recorded as Ashya2i delivery"}</div>
+</div>
+</div>}
+
+{/* ─── TALABAT ─── */}
+{pmMod==="talabat"&&<div style={{padding:"0 20px 18px",textAlign:"center"}}>
+<div style={{padding:"22px 20px",background:"rgba(249,115,22,.12)",border:"2px solid rgba(249,115,22,.4)",borderRadius:14,marginBottom:10}}>
+<div style={{fontSize:54,marginBottom:8}}>🍔</div>
+<div style={{fontSize:15,fontWeight:800,color:"#fed7aa"}}>{rtl?"طلب عبر طلبات":"Talabat Order"}</div>
+<div style={{fontSize:12,color:"#fdba74",marginTop:8,fontWeight:600}}>{rtl?"سيتم تسجيل الفاتورة كطلب توصيل طلبات":"Will be recorded as Talabat delivery"}</div>
+</div>
+</div>}
+
+{/* ─── BIG CONFIRM BUTTON ─── */}
+<div style={{padding:"0 20px 20px"}}>
+<button
+  onClick={cP}
+  disabled={!canC||processing}
+  style={{
+    width:"100%",
+    height:64,
+    background:processing?"#475569":(canC?"linear-gradient(180deg,#10b981,#059669)":"#475569"),
+    border:"none",
+    borderRadius:14,
+    color:"#fff",
+    fontSize:20,
+    fontWeight:900,
+    cursor:processing?"wait":(canC?"pointer":"not-allowed"),
+    fontFamily:"var(--f)",
+    display:"flex",
+    alignItems:"center",
+    justifyContent:"center",
+    gap:10,
+    boxShadow:canC&&!processing?"0 8px 24px rgba(16,185,129,.35)":"none",
+    opacity:!canC&&!processing?.5:1,
+    transition:"all .15s"
+  }}
+>
+{processing?<>
+  <span style={{fontSize:22,animation:"spin 1s linear infinite",display:"inline-block"}}>⏳</span>
+  <span>{rtl?"جاري الحفظ...":"Processing..."}</span>
+</>:<>
+  <span style={{fontSize:22}}>✓</span>
+  <span>{t.confirm}</span>
+  <span style={{fontFamily:"var(--m)",fontWeight:900,opacity:.95}}>— {fm(selCust&&redeemPts>0?totAfterRedeem:tot)}</span>
+</>}
+</button>
+{!canC&&pmMod==="cash"&&parseFloat(cTend)>0&&<div style={{textAlign:"center",fontSize:12,color:"#fca5a5",marginTop:10,fontWeight:700}}>⚠️ {rtl?"المبلغ المستلم أقل من الإجمالي":"Amount received is less than total"}</div>}
+</div>
+
+</div></div>}
 
 {/* RECEIPT */}
 {rcMod&&<div className="ov"><div className="md" onClick={e=>e.stopPropagation()} style={{maxWidth:paperSize==="A4"?680:440,position:"relative"}}>
@@ -15612,18 +16809,26 @@ try{
 {/* STOCKTAKE SESSION VIEW MODAL */}
 
 {/* PURCHASE INVOICE */}
-{invMod&&<div className="ov" onClick={()=>setInvMod(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:20}}>
-<div onClick={e=>e.stopPropagation()} style={{background:"#fff",borderRadius:16,padding:"14px 18px",width:"100%",maxWidth:1400,maxHeight:"98vh",display:"flex",flexDirection:"column"}}>
+{invMod&&<div className="ov" onClick={()=>setInvMod(false)} style={{position:"fixed",inset:0,background:"rgba(20,40,80,.6)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:20}}>
+<div onClick={e=>e.stopPropagation()} style={{background:"#fff",borderRadius:18,padding:"14px 18px",width:"100%",maxWidth:1400,maxHeight:"98vh",display:"flex",flexDirection:"column",boxShadow:"var(--brand-shadow-lg)"}}>
 
-{/* Header */}
-<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-  <h2 style={{fontSize:17,fontWeight:800,margin:0,color:invIsReconciliation?"#d97706":"#111827"}}>{invIsReconciliation?"🔍 "+(rtl?"فاتورة مطابقة تاريخية":"Historical Reconciliation Invoice"):"🧾 "+t.addInv}</h2>
+{/* Header — Brand Style */}
+<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,paddingBottom:12,borderBottom:"2px solid var(--brand-light)"}}>
+  <div style={{display:"flex",alignItems:"center",gap:12}}>
+    <div style={{width:42,height:42,borderRadius:10,background:"linear-gradient(135deg,var(--brand) 0%,var(--brand-dark) 100%)",color:"#fff",display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,boxShadow:"var(--brand-shadow)"}}>
+      {invIsReconciliation?"🔍":"🛒"}
+    </div>
+    <div>
+      <h2 style={{fontSize:17,fontWeight:800,margin:0,color:"var(--brand)"}}>{invIsReconciliation?(rtl?"فاتورة مطابقة تاريخية":"Historical Reconciliation"):(rtl?"فاتورة شراء جديدة":"New Purchase Invoice")}</h2>
+      <div style={{fontSize:10,color:"#6b7280",marginTop:2}}>3045 SUPERMARKET</div>
+    </div>
+  </div>
   <div style={{display:"flex",gap:8,alignItems:"center"}}>
     <button onClick={()=>{setOcrMod(true);setOcrPages([]);setOcrExtractedRows([]);window._pendingOcrPages=null}}
-      style={{padding:"8px 16px",background:"linear-gradient(135deg,#7c3aed,#9333ea)",color:"#fff",border:"none",borderRadius:8,fontSize:12,fontWeight:800,cursor:"pointer",display:"flex",alignItems:"center",gap:6,boxShadow:"0 2px 8px rgba(124,58,237,.3)"}}>
-      📷 {rtl?"مسح فاتورة OCR":"Scan Invoice (OCR)"}
+      style={{padding:"9px 16px",background:"linear-gradient(135deg,var(--accent) 0%,var(--accent-dark) 100%)",color:"#fff",border:"none",borderRadius:10,fontSize:12,fontWeight:800,cursor:"pointer",display:"flex",alignItems:"center",gap:6,boxShadow:"0 2px 8px rgba(211,47,47,0.25)"}}>
+      📷 {rtl?"مسح OCR":"OCR Scan"}
     </button>
-    <button onClick={()=>setInvMod(false)} style={{background:"none",border:"none",fontSize:20,cursor:"pointer",color:"#6b7280"}}>✕</button>
+    <button onClick={()=>setInvMod(false)} style={{background:"#f3f4f6",border:"none",fontSize:18,cursor:"pointer",color:"#6b7280",width:34,height:34,borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
   </div>
 </div>
 
@@ -15910,10 +17115,10 @@ try{
   const canSave=!invSaving&&hasSupplier&&hasInvNo&&validCount>0;
   return <div>
     <button onClick={saveNewInvoice} disabled={!canSave}
-      style={{width:"100%",padding:"14px",background:canSave?"linear-gradient(135deg,#059669,#10b981)":"#d1d5db",border:"none",borderRadius:10,color:"#fff",fontWeight:800,cursor:canSave?"pointer":"not-allowed",fontSize:15}}>
-      {invSaving?"⏳ "+(rtl?"جاري الحفظ...":"Saving..."):"✓ "+t.saveInv}
+      style={{width:"100%",padding:"16px",background:canSave?"linear-gradient(135deg,var(--brand) 0%,var(--brand-dark) 100%)":"#d1d5db",border:"none",borderRadius:12,color:"#fff",fontWeight:800,cursor:canSave?"pointer":"not-allowed",fontSize:16,boxShadow:canSave?"0 4px 16px rgba(30,58,111,0.25)":"none",letterSpacing:0.3}}>
+      {invSaving?"⏳ "+(rtl?"جاري الحفظ...":"Saving..."):"💾 "+t.saveInv}
     </button>
-    {!canSave&&!invSaving&&<div style={{fontSize:10,color:"#dc2626",marginTop:4,textAlign:"center"}}>
+    {!canSave&&!invSaving&&<div style={{fontSize:11,color:"var(--accent)",marginTop:6,textAlign:"center",padding:"6px 12px",background:"var(--accent-light)",borderRadius:8,border:"1px solid var(--accent-light)"}}>
       {!hasSupplier?"⚠️ "+(rtl?"اختر المورد أولاً":"Select supplier"):!hasInvNo?"⚠️ "+(rtl?"رقم الفاتورة مطلوب":"Invoice # required"):validCount===0?"⚠️ "+(rtl?"أضف منتج بباركود واسم وكمية":"Add product with barcode, name & qty"):""}
     </div>}
   </div>
@@ -16589,7 +17794,7 @@ const mv=await DB.getMoneyMovements();setMovements(mv);setMovMod(false);sT("✓ 
 
 {/* CLOSE SHIFT MODAL */}
 {closeShiftMod&&activeShift&&(()=>{
-const shiftTxs=txns.filter(tx=>{try{const ts=new Date(tx.ts);return ts>=new Date(activeShift.shift_start)&&tx.voidStatus!=="voided"}catch{return false}});
+const shiftTxs=txns.filter(tx=>{if(tx.voidStatus==="voided")return false;if(tx.shiftId)return tx.shiftId===activeShift.id;try{return new Date(tx.ts)>=new Date(activeShift.shift_start)}catch{return false}});
 const cashSales=shiftTxs.filter(tx=>tx.method==="cash").reduce((s,tx)=>s+tx.tot,0);
 const cardSales=shiftTxs.filter(tx=>tx.method==="card").reduce((s,tx)=>s+tx.tot,0);
 const madaSales=shiftTxs.filter(tx=>tx.method==="mobile").reduce((s,tx)=>s+tx.tot,0);
@@ -18614,21 +19819,36 @@ setBatchMod(false);sT("✓ "+(rtl?"تمت الإضافة":"Batch added"),"ok")}c
 <h2>↩️ {rtl?"مرتجع مبيعات":"Sales Return"}<button className="mc" onClick={()=>setSalesReturnMod(false)}>✕</button></h2>
 <div className="pf"><label>{t.receipt} #</label>
 <div style={{display:"flex",gap:6}}>
-<input placeholder={rtl?"رقم الإيصال":"Receipt number"} onChange={e=>{const rn=e.target.value;const tx=txns.find(t2=>t2.rn===rn);setReturnTxn(tx||null);if(tx)setReturnItems(tx.items.map(i=>({...i,returnQty:0,reason:""})))}}/>
+<input placeholder={rtl?"رقم الإيصال":"Receipt number"} onChange={e=>{const rn=e.target.value;const tx=txns.find(t2=>t2.rn===rn);setReturnTxn(tx||null);if(tx)setReturnItems(prepareReturnItems(tx))}}/>
 </div>
 </div>
 {returnTxn&&<>
 <div style={{background:"#eff6ff",borderRadius:12,padding:12,marginBottom:12,fontSize:12}}>
 <div style={{fontWeight:700,color:"#2563eb"}}>{returnTxn.rn} — {returnTxn.date}</div>
 <div style={{color:"#6b7280"}}>{returnTxn.items.length} {t.items} · {fm(returnTxn.tot)}</div>
+{(()=>{const rs=getTxnReturnStatus(returnTxn);if(rs.status==="partial")return <div style={{marginTop:6,padding:"6px 10px",background:"#fef3c7",border:"1px solid #fcd34d",borderRadius:8,fontSize:11,color:"#92400e",fontWeight:700}}>⚠️ {rtl?"إرجاع جزئي سابق":"Previous partial return"} — {fm(rs.totalReturned)} ({rs.returnCount} {rtl?"عملية":"returns"})</div>;return null})()}
 </div>
+{returnItems.length===0?
+<div style={{padding:30,textAlign:"center",background:"#f9fafb",border:"2px dashed #d1d5db",borderRadius:12,color:"#6b7280"}}>
+<div style={{fontSize:42,opacity:.5,marginBottom:8}}>✓</div>
+<div style={{fontSize:14,fontWeight:700,color:"#374151"}}>{rtl?"كل المنتجات تم إرجاعها مسبقاً":"All items already returned"}</div>
+<div style={{fontSize:11,marginTop:4}}>{rtl?"لا توجد منتجات قابلة للإرجاع في هذه الفاتورة":"No returnable items left for this invoice"}</div>
+</div>
+:<>
 <div style={{fontSize:12,fontWeight:700,marginBottom:8}}>{rtl?"اختر العناصر للإرجاع":"Select items to return"}:</div>
 {returnItems.map((ri,i)=><div key={i} style={{display:"flex",gap:6,alignItems:"center",padding:"8px 0",borderBottom:"1px solid #f3f4f6"}}>
-<div style={{flex:2,fontSize:12,fontWeight:600}}>{ri.n} <span style={{color:"#9ca3af"}}>×{ri.qty}</span></div>
-<input type="number" min="0" max={ri.qty} value={ri.returnQty} onChange={e=>{const v=[...returnItems];v[i]={...v[i],returnQty:Math.min(parseInt(e.target.value)||0,ri.qty)};setReturnItems(v)}} style={{width:50,padding:"6px",borderRadius:6,border:"1px solid #e5e7eb",fontFamily:"var(--m)",textAlign:"center"}} placeholder="0"/>
+<div style={{flex:2,fontSize:12}}>
+<div style={{fontWeight:600}}>{ri.n}</div>
+<div style={{fontSize:10,color:"#6b7280",marginTop:2}}>
+<span style={{color:"#374151",fontWeight:600}}>{rtl?"المباع":"Sold"}: {ri.qty}</span>
+{ri.alreadyReturned>0&&<span style={{color:"#d97706",fontWeight:700,marginLeft:8,marginRight:8}}>· {rtl?"مُرجع":"Returned"}: {ri.alreadyReturned}</span>}
+<span style={{color:"#059669",fontWeight:700,marginLeft:8,marginRight:8}}>· {rtl?"متاح":"Available"}: {ri.maxReturnable}</span>
+</div>
+</div>
+<input type="number" min="0" max={ri.maxReturnable} value={ri.returnQty} onChange={e=>{const v=[...returnItems];v[i]={...v[i],returnQty:Math.min(Math.max(0,parseInt(e.target.value)||0),ri.maxReturnable)};setReturnItems(v)}} style={{width:50,padding:"6px",borderRadius:6,border:"1.5px solid "+(ri.returnQty>0?"#dc2626":"#e5e7eb"),fontFamily:"var(--m)",textAlign:"center",fontWeight:700}} placeholder="0"/>
 <input value={ri.reason} onChange={e=>{const v=[...returnItems];v[i]={...v[i],reason:e.target.value};setReturnItems(v)}} placeholder={rtl?"السبب":"Reason"} style={{flex:1,padding:"6px 8px",borderRadius:6,border:"1px solid #e5e7eb",fontSize:11}}/>
-</div>)}
-{(()=>{const totalReturn=returnItems.reduce((s,ri)=>s+ri.returnQty*ri.p,0);const isFullReturn=returnItems.every(ri=>ri.returnQty===ri.qty);
+</div>)}</>}
+{(()=>{const totalReturn=returnItems.reduce((s,ri)=>s+ri.returnQty*ri.p,0);const isFullReturn=returnItems.length>0&&returnItems.every(ri=>ri.returnQty===ri.maxReturnable);
 return totalReturn>0&&<>
 <div style={{background:"#fef2f2",borderRadius:12,padding:14,textAlign:"center",marginTop:12}}>
 <div style={{fontSize:11,color:"#6b7280"}}>{rtl?"مبلغ الإرجاع":"Refund Amount"}</div>
